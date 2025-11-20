@@ -1,0 +1,24 @@
+# Build and IDE files
+/build
+/build_release
+/CMakeFiles
+/CMakeCache.txt
+Makefile
+*.mk
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+*.log
+.DS_Store
+
+# QuickFIX build artifacts
+/third_party/quickfix_install/
+
+# Local config and logs
+/log
+/store
+
+# temp files
+*~

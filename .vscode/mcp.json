@@ -1,0 +1,36 @@
+{
+  // 💡 Inputs will be prompted on first server start,
+  //    then stored securely by VS Code.
+  "inputs": [],
+  "servers": {
+    "context7": {
+      "type": "http",
+      "url": "https://mcp.context7.com/mcp"
+    },
+    "sequential-thinking": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-sequential-thinking"
+      ]
+    },
+    "playwright": {
+      "command": "npx",
+      "args": [
+        "@playwright/mcp@latest"
+      ]
+    },
+    "memory": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-memory"
+      ]
+    },
+    "mcp-deepwiki": {
+      "command": "npx",
+      "args": ["-y", "mcp-deepwiki@latest"]
+    }
+    
+  }
+}

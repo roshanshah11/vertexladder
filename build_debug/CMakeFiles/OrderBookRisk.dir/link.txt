@@ -1,0 +1,2 @@
+/usr/bin/ar qc libOrderBookRisk.a CMakeFiles/OrderBookRisk.dir/src/Risk/RiskManager.cpp.o
+/usr/bin/ranlib libOrderBookRisk.a

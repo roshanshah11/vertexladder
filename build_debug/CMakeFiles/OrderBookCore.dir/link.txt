@@ -1,0 +1,2 @@
+/usr/bin/ar qc libOrderBookCore.a CMakeFiles/OrderBookCore.dir/src/Core/OrderBook.cpp.o CMakeFiles/OrderBookCore.dir/src/Core/OrderManager.cpp.o CMakeFiles/OrderBookCore.dir/src/Core/MatchingEngine.cpp.o CMakeFiles/OrderBookCore.dir/src/Core/Order.cpp.o
+/usr/bin/ranlib libOrderBookCore.a
