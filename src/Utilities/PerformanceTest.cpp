@@ -70,6 +70,9 @@ PerformanceTest::TestResults PerformanceTest::runPerformanceTest(const TestConfi
         // setDisabled(true) can cause instability in debug builds; set only in Release mode
 #ifdef NDEBUG
         market_data->setDisabled(true);
+        if (risk_manager) {
+            risk_manager->setBypass(true);
+        }
 #endif
     }
 

@@ -83,6 +83,12 @@ public:
      * @brief Get the account associated with an order
      */
     virtual std::string getAccountForOrder(OrderId order_id) const = 0;
+
+    /**
+     * @brief Bypass risk checks (for testing / benchmarking only)
+     */
+    virtual void setBypass(bool bypass) { (void)bypass; }
+    virtual bool isBypassed() const { return false; }
 };
 
 /**

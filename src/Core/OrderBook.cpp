@@ -160,6 +160,21 @@ void OrderBook::clearBook() {
 // Core operations
 OrderResult OrderBook::addOrder(const Order& order) {
     PERF_MEASURE_SCOPE("OrderBook::addOrder");
+    // If risk manager is configured and not bypassed, perform a fast pre-validation
+    // before acquiring the command queue lock to avoid blocking producers with a
+    // potentially long-running validation.
+    if (risk_manager_ && !risk_manager_->isBypassed()) {
+        std::string account = order.account.empty() ? "default" : order.account;
+        const Portfolio& portfolio = risk_manager_->getPortfolio(account);
+        auto risk_check = risk_manager_->validateOrder(order, portfolio);
+        if (risk_check.isRejected()) {
+            if (logger_) {
+                logger_->error("Order rejected by risk manager before enqueue: " + risk_check.reason,
+                               "OrderBook::addOrder - OrderID: " + std::to_string(order.id.value));
+            }
+            return OrderResult::error("Rejected by risk");
+        }
+    }
     // Create a copy of the order for processing
     auto order_copy = std::make_unique<Order>(order.id.value, order.side, order.type, order.price, order.quantity, order.symbol);
     order_copy->timestamp = std::chrono::system_clock::now();

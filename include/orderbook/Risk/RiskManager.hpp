@@ -3,6 +3,7 @@
 #include "../Core/Interfaces.hpp"
 #include "../Core/Order.hpp"
 #include <unordered_map>
+#include <atomic>
 #include <memory>
 
 namespace orderbook {
@@ -41,12 +42,17 @@ public:
     void associateOrderWithAccount(OrderId order_id, const std::string& account) override;
     std::string getAccountForOrder(OrderId order_id) const override;
 
+    // Benchmark/testing helper - bypass risk checks
+    void setBypass(bool bypass) override;
+    bool isBypassed() const override;
+
 private:
     RiskLimits limits_;
     mutable std::unordered_map<std::string, Portfolio> portfolios_;
     std::unordered_map<OrderId, std::string, OrderIdHash> order_to_account_;
     std::shared_ptr<Config> config_;
     LoggerPtr logger_;
+    std::atomic<bool> bypass_{false};
     
     // Validation helpers
     bool validateOrderSize(Quantity quantity) const;

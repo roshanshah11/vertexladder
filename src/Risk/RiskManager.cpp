@@ -23,6 +23,10 @@ RiskManager::RiskManager(std::shared_ptr<Config> config, LoggerPtr logger)
 }
 
 RiskCheck RiskManager::validateOrder(const Order& order, const Portfolio& portfolio) {
+    if (bypass_.load(std::memory_order_relaxed)) {
+        if (logger_) logger_->debug("Risk checks bypassed, approving order", "RiskManager::validateOrder");
+        return RiskCheck(RiskResult::Approved, "Bypassed");
+    }
     PERF_TIMER("RiskManager::validateOrder", logger_);
     
     if (logger_) {
@@ -140,6 +144,17 @@ void RiskManager::reloadConfiguration() {
     if (config_) {
         loadConfiguration(config_);
     }
+}
+
+void RiskManager::setBypass(bool bypass) {
+    bypass_.store(bypass, std::memory_order_relaxed);
+    if (logger_) {
+        logger_->info(std::string("RiskManager bypass set to ") + (bypass ? "true" : "false"), "RiskManager::setBypass");
+    }
+}
+
+bool RiskManager::isBypassed() const {
+    return bypass_.load(std::memory_order_relaxed);
 }
 
 bool RiskManager::validateOrderSize(Quantity quantity) const {
