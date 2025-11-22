@@ -45,6 +45,8 @@ public:
     void logLatencyStats(const std::string& operation, uint64_t min_ns, uint64_t max_ns, uint64_t avg_ns);
     void logMemoryUsage(const std::string& component, size_t bytes_used, size_t bytes_allocated);
     void setLogLevel(LogLevel level) override;
+
+    bool isLogLevelEnabled(LogLevel level) override;
     
     // Static convenience methods for global logger
     static void setGlobalLogger(std::shared_ptr<Logger> logger);

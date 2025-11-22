@@ -1,5 +1,6 @@
 #include "orderbook/MarketData/MarketDataFeed.hpp"
 #include "orderbook/Utilities/PerformanceTimer.hpp"
+#include "orderbook/Utilities/PerformanceMeasurement.hpp"
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
@@ -8,15 +9,17 @@ namespace orderbook {
 
 MarketDataPublisher::MarketDataPublisher(LoggerPtr logger) 
     : sequence_number_(0), logger_(logger) {
+    disabled_.store(false);
     if (logger_) {
         logger_->info("MarketDataPublisher initialized", "MarketDataPublisher::ctor");
     }
 }
 
 void MarketDataPublisher::publishTrade(const Trade& trade) {
-    PERF_TIMER("MarketDataPublisher::publishTrade", logger_);
+    if (disabled_.load(std::memory_order_relaxed)) return;
+    PERF_MEASURE_SCOPE("MarketDataPublisher::publishTrade");
     
-    if (logger_) {
+    if (logger_ && logger_->isLogLevelEnabled(LogLevel::DEBUG)) {
         logger_->debug("Publishing trade ID: " + std::to_string(trade.id.value) +
                       " Symbol: " + trade.symbol + " Price: " + std::to_string(trade.price) +
                       " Quantity: " + std::to_string(trade.quantity), "MarketDataPublisher::publishTrade");
@@ -43,13 +46,15 @@ void MarketDataPublisher::publishTrade(const Trade& trade) {
         stats_.trades_published++;
     }
     
-    if (logger_) {
+    if (logger_ && logger_->isLogLevelEnabled(LogLevel::DEBUG)) {
         logger_->debug("Trade published successfully, sequence: " + std::to_string(seq), 
                       "MarketDataPublisher::publishTrade");
     }
 }
 
 void MarketDataPublisher::publishBookUpdate(const BookUpdate& update) {
+    if (disabled_.load(std::memory_order_relaxed)) return;
+    PERF_MEASURE_SCOPE("MarketDataPublisher::publishBookUpdate");
     auto start_time = getCurrentTimeNs();
     
     // Notify typed subscribers
@@ -70,6 +75,8 @@ void MarketDataPublisher::publishBookUpdate(const BookUpdate& update) {
 }
 
 void MarketDataPublisher::publishBestPrices(const BestPrices& prices) {
+    if (disabled_.load(std::memory_order_relaxed)) return;
+    PERF_MEASURE_SCOPE("MarketDataPublisher::publishBestPrices");
     auto start_time = getCurrentTimeNs();
     
     // Generate sequence number for gap detection
@@ -93,6 +100,8 @@ void MarketDataPublisher::publishBestPrices(const BestPrices& prices) {
 }
 
 void MarketDataPublisher::publishDepth(const MarketDepth& depth) {
+    if (disabled_.load(std::memory_order_relaxed)) return;
+    PERF_MEASURE_SCOPE("MarketDataPublisher::publishDepth");
     auto start_time = getCurrentTimeNs();
     
     // Generate sequence number for gap detection
@@ -123,6 +132,14 @@ void MarketDataPublisher::subscribe(std::function<void(const std::string&)> call
 void MarketDataPublisher::subscribe(std::shared_ptr<IMarketDataSubscriber> subscriber) {
     std::lock_guard<std::mutex> lock(subscribers_mutex_);
     typed_subscribers_.push_back(subscriber);
+}
+
+void MarketDataPublisher::setDisabled(bool disabled) {
+    disabled_.store(disabled, std::memory_order_relaxed);
+}
+
+bool MarketDataPublisher::isDisabled() const {
+    return disabled_.load(std::memory_order_relaxed);
 }
 
 void MarketDataPublisher::unsubscribe(std::shared_ptr<IMarketDataSubscriber> subscriber) {

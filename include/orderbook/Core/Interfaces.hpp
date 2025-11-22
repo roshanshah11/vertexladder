@@ -182,6 +182,12 @@ public:
      * @param level Minimum level to log
      */
     virtual void setLogLevel(LogLevel level) = 0;
+
+    /**
+     * @brief Query whether a particular log level is enabled. Allows callers
+     * to avoid expensive formatting when the message would be dropped.
+     */
+    virtual bool isLogLevelEnabled(LogLevel level) = 0;
 };
 
 // Convenience type aliases for shared pointers

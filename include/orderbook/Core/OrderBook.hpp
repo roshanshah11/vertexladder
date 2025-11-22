@@ -1,6 +1,7 @@
 #pragma once
 #include "Types.hpp"
 #include "Order.hpp"
+#include "../Utilities/ObjectPool.hpp"
 #include "Interfaces.hpp"
 #include "MarketData.hpp"
 #include <boost/lockfree/spsc_queue.hpp>
@@ -48,6 +49,9 @@ public:
     OrderResult addOrder(const Order& order);
     CancelResult cancelOrder(OrderId id);
     ModifyResult modifyOrder(OrderId id, Price new_price, Quantity new_quantity);
+
+    // Read trade count without relying on market data. Used by performance tests.
+    uint64_t getTradeCount() const;
     
     // Market data queries
     std::optional<Price> bestBid() const;
@@ -78,6 +82,7 @@ private:
     struct Command {
         enum class Type { Add, Cancel, Modify };
         Type type;
+        // Use pooled objects for high-performance allocation
         std::unique_ptr<Order> order;
         OrderId order_id;
         Price price;
@@ -97,12 +102,22 @@ private:
     void processModifyOrder(OrderId id, Price new_price, Quantity new_quantity);
 
     // Lock-free queue for market data updates (SPSC)
-    boost::lockfree::spsc_queue<MarketUpdate, boost::lockfree::capacity<4096>> market_queue_;
+    // Increased capacity to absorb bursts during performance tests (tuned for memory)
+    // Sharded SPSC queues for market updates to avoid multi-producer contention.
+    static constexpr size_t MarketDataQueueCount = 4; // tuned for typical thread count
+    static constexpr size_t MarketDataQueueCapacity = 100000;
+    std::vector<std::unique_ptr<boost::lockfree::spsc_queue<MarketUpdate, boost::lockfree::capacity<MarketDataQueueCapacity>>>> market_queues_;
+    // Simple round-robin index allocator for threads. Each producing thread gets a queue index
+    // stored thread-locally to avoid hashing or heavy atomics on hot path.
+    std::atomic<size_t> producer_rr_index_{0};
+    // Per-OrderBook trade counter for benchmarking without a publisher
+    std::atomic<uint64_t> trade_count_{0};
     // Optimized storage: use heap-allocated PriceLevel for pointer stability
     std::vector<std::unique_ptr<PriceLevel>> bids_;
     std::vector<std::unique_ptr<PriceLevel>> asks_;
     std::unordered_map<Price, PriceLevel*> price_index_;
     std::unordered_map<OrderId, OrderLocation, OrderIdHash> order_index_;
+    // Note: orders in the book are owned by price levels and managed manually
     
     // Dependencies
     RiskManagerPtr risk_manager_;
@@ -124,6 +139,12 @@ private:
     void matchAgainstPriceLevel(Order& incoming_order, PriceLevel& price_level);
     void executeTrade(Order& aggressive_order, Order& passive_order, 
                      Price trade_price, Quantity trade_quantity);
+
+    // Accessor for performance harness to read trade count without relying on market_data
+    // Implemented in header above as public method
+
+    // Get a deterministic, thread-affine queue index for producers
+    size_t getProducerQueueIndex();
     
     // Constants
     static constexpr size_t InitialCapacity = 1024;

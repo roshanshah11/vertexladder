@@ -209,6 +209,11 @@ void Logger::setLogLevel(LogLevel level) {
     config_.min_level = level;
 }
 
+bool Logger::isLogLevelEnabled(LogLevel level) {
+    std::lock_guard<std::mutex> lock(log_mutex_);
+    return shouldLog(level);
+}
+
 void Logger::setGlobalLogger(std::shared_ptr<Logger> logger) {
     std::lock_guard<std::mutex> lock(global_mutex_);
     global_logger_ = logger;

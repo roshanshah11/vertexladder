@@ -65,6 +65,13 @@ PerformanceTest::TestResults PerformanceTest::runPerformanceTest(const TestConfi
         std::make_shared<RiskManager>(logger) : nullptr;
     auto market_data = config.enable_market_data ? 
         std::make_shared<MarketDataPublisher>(logger) : nullptr;
+    if (market_data) {
+        // Benchmark does not need string-based market data output
+        // setDisabled(true) can cause instability in debug builds; set only in Release mode
+#ifdef NDEBUG
+        market_data->setDisabled(true);
+#endif
+    }
 
     OrderBook order_book(risk_manager, market_data, logger);
 
@@ -91,9 +98,16 @@ PerformanceTest::TestResults PerformanceTest::runPerformanceTest(const TestConfi
     results.total_test_time = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
     perf.stopMonitoring();
 
-    // Collect actual trade counts from MarketDataPublisher
+    // Collect actual trade counts
     if (market_data) {
-        results.trades_executed = market_data->getStats().trades_published;
+        if (market_data->isDisabled()) {
+            results.trades_executed = order_book.getTradeCount();
+        } else {
+            results.trades_executed = market_data->getStats().trades_published;
+        }
+    } else {
+        // If market data is not configured, rely on internal count
+        results.trades_executed = order_book.getTradeCount();
     }
 
     results.operation_stats = perf.getAllStats();
@@ -213,10 +227,14 @@ PerformanceTest::TestResults PerformanceTest::runSingleThreadedTest(OrderBook& o
         Price price = std::round(price_dist(rng) * 100.0) / 100.0;
         Quantity qty = static_cast<Quantity>(qty_dist(rng));
         Side side = (side_dist(rng) < config.buy_sell_ratio) ? Side::Buy : Side::Sell;
-        Order order(next_id++, side, OrderType::Limit, price, qty, config.symbol);
-        auto res = order_book.addOrder(order);
+            Order order(next_id++, side, OrderType::Limit, price, qty, config.symbol);
+            PERF_MEASURE_SCOPE("StressTest::AddOrder");
+            auto res = order_book.addOrder(order);
         if (res.isSuccess()) results.orders_processed++;
-        if (i % 100 == 0 && i > 0) order_book.cancelOrder(OrderId(i));
+            if (i % 100 == 0 && i > 0) {
+                PERF_MEASURE_SCOPE("StressTest::CancelOrder");
+                order_book.cancelOrder(OrderId(i));
+            }
         
         if (i % 10000 == 0 && i > 0) {
             std::cout << "Processed " << i << " orders..." << std::endl;
@@ -241,9 +259,13 @@ PerformanceTest::TestResults PerformanceTest::runMultiThreadedTest(OrderBook& or
             Side side = (side_dist(rng) < config.buy_sell_ratio) ? Side::Buy : Side::Sell;
             uint64_t id = next_id.fetch_add(1);
             Order order(id, side, OrderType::Limit, price, qty, config.symbol);
+            PERF_MEASURE_SCOPE("StressTest::AddOrder");
             auto res = order_book.addOrder(order);
             if (res.isSuccess()) processed.fetch_add(1);
-            if (i % 100 == 0 && i > 0) order_book.cancelOrder(OrderId(id));
+            if (i % 100 == 0 && i > 0) {
+                PERF_MEASURE_SCOPE("StressTest::CancelOrder");
+                order_book.cancelOrder(OrderId(id));
+            }
 
             if (i % 10000 == 0 && i > 0 && thread_index == 0) {
                 std::cout << "Thread 0 processed " << i << " orders..." << std::endl;

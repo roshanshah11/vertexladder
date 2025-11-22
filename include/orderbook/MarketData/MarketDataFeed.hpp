@@ -85,6 +85,10 @@ public:
     PublishingStats getStats() const;
     void resetStats();
 
+    // Enable/disable publishing; when disabled, publish* are no-ops and avoid formatting
+    void setDisabled(bool disabled);
+    bool isDisabled() const;
+
 private:
     // Subscriber management
     std::vector<std::function<void(const std::string&)>> string_subscribers_;
@@ -97,6 +101,7 @@ private:
     // Performance tracking
     mutable std::mutex stats_mutex_;
     PublishingStats stats_;
+    std::atomic<bool> disabled_{false};
     
     // Logging
     LoggerPtr logger_;

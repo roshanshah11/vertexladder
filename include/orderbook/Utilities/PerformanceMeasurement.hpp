@@ -121,18 +121,28 @@ public:
      * @param latency Measured latency
      */
     void recordLatency(const std::string& operation_name, Duration latency) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        
-        auto& samples = latency_samples_[operation_name];
-        samples.push_back(latency);
-        
-        // Limit sample size to prevent unbounded growth
-        constexpr size_t MAX_SAMPLES = 10000;
-        if (samples.size() > MAX_SAMPLES) {
-            samples.erase(samples.begin(), samples.begin() + (samples.size() - MAX_SAMPLES));
+        // Fast-path: store in thread-local store to avoid global locking on hot-path
+        thread_local std::shared_ptr<ThreadSampleStore> tls_store = nullptr;
+        if (!tls_store) {
+            tls_store = std::make_shared<ThreadSampleStore>();
+            std::lock_guard<std::mutex> reg_lock(registry_mutex_);
+            thread_stores_.push_back(tls_store);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(tls_store->lock);
+            auto& samples = tls_store->samples[operation_name];
+            samples.push_back(latency);
+            // Limit per-thread sample size
+            constexpr size_t MAX_SAMPLES_PER_THREAD = 2000;
+            if (samples.size() > MAX_SAMPLES_PER_THREAD) {
+                samples.erase(samples.begin(), samples.begin() + (samples.size() - MAX_SAMPLES_PER_THREAD));
+            }
         }
         
-        // Update throughput
+        // Per-thread stores apply their own size limits above
+        
+        // Update throughput (global)
         throughput_measurements_[operation_name].recordOperation();
     }
     
@@ -142,14 +152,30 @@ public:
      * @return Operation statistics
      */
     OperationStats getOperationStats(const std::string& operation_name) const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        
-        auto it = latency_samples_.find(operation_name);
-        if (it == latency_samples_.end() || it->second.empty()) {
+        // Merge samples for this operation from global and per-thread stores
+        std::vector<Duration> samples;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto it = latency_samples_.find(operation_name);
+            if (it != latency_samples_.end()) {
+                samples = it->second;
+            }
+        }
+
+        std::lock_guard<std::mutex> reg_lock(registry_mutex_);
+        for (const auto& store_ptr : thread_stores_) {
+            if (!store_ptr) continue;
+            std::lock_guard<std::mutex> lock(store_ptr->lock);
+            auto it = store_ptr->samples.find(operation_name);
+            if (it != store_ptr->samples.end()) {
+                const auto& tsamp = it->second;
+                samples.insert(samples.end(), tsamp.begin(), tsamp.end());
+            }
+        }
+
+        if (samples.empty()) {
             return OperationStats{operation_name, 0};
         }
-        
-        const auto& samples = it->second;
         OperationStats stats;
         stats.operation_name = operation_name;
         stats.sample_count = samples.size();
@@ -182,13 +208,57 @@ public:
      * @return Map of operation name to statistics
      */
     std::unordered_map<std::string, OperationStats> getAllStats() const {
-        std::lock_guard<std::mutex> lock(mutex_);
-        
-        std::unordered_map<std::string, OperationStats> all_stats;
-        for (const auto& [operation_name, samples] : latency_samples_) {
-            all_stats[operation_name] = getOperationStats(operation_name);
+        // Merge global and per-thread samples. We avoid holding mutex_ while
+        // reading thread stores to not block recordLatency on hot-path for long.
+        std::unordered_map<std::string, std::vector<Duration>> merged;
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (const auto& [name, samples] : latency_samples_) {
+                merged[name] = samples;
+            }
         }
-        
+
+        // Merge thread-local stores
+        {
+            std::lock_guard<std::mutex> reg_lock(registry_mutex_);
+            for (const auto& store_ptr : thread_stores_) {
+                if (!store_ptr) continue;
+                std::lock_guard<std::mutex> lock(store_ptr->lock);
+                for (const auto& [name, samples] : store_ptr->samples) {
+                    auto& vec = merged[name];
+                    vec.insert(vec.end(), samples.begin(), samples.end());
+                }
+            }
+        }
+
+        std::unordered_map<std::string, OperationStats> all_stats;
+        for (const auto& [operation_name, samples] : merged) {
+            // compute stats
+            OperationStats stats;
+            stats.operation_name = operation_name;
+            stats.sample_count = samples.size();
+            stats.min_latency = samples.empty() ? Duration::zero() : *std::min_element(samples.begin(), samples.end());
+            stats.max_latency = samples.empty() ? Duration::zero() : *std::max_element(samples.begin(), samples.end());
+            stats.total_time = std::accumulate(samples.begin(), samples.end(), Duration::zero());
+            if (!samples.empty()) stats.avg_latency = Duration(stats.total_time.count() / samples.size());
+
+            auto sorted_samples = samples;
+            std::sort(sorted_samples.begin(), sorted_samples.end());
+            if (!sorted_samples.empty()) {
+                stats.p50_latency = sorted_samples[sorted_samples.size() * 50 / 100];
+                stats.p95_latency = sorted_samples[sorted_samples.size() * 95 / 100];
+                stats.p99_latency = sorted_samples[sorted_samples.size() * 99 / 100];
+            }
+
+            auto throughput_it = throughput_measurements_.find(operation_name);
+            if (throughput_it != throughput_measurements_.end()) {
+                stats.throughput_ops_per_sec = throughput_it->second.getCurrentThroughput();
+            }
+
+            all_stats[operation_name] = stats;
+        }
+
         return all_stats;
     }
     
@@ -200,6 +270,15 @@ public:
         latency_samples_.clear();
         for (auto& [name, throughput] : throughput_measurements_) {
             throughput.reset();
+        }
+
+        // clear thread stores
+        std::lock_guard<std::mutex> reg_lock(registry_mutex_);
+        for (auto& s : thread_stores_) {
+            if (s) {
+                std::lock_guard<std::mutex> l(s->lock);
+                s->samples.clear();
+            }
         }
     }
     
@@ -262,6 +341,19 @@ private:
     mutable std::mutex mutex_;
     std::unordered_map<std::string, std::vector<Duration>> latency_samples_;
     std::unordered_map<std::string, ThroughputMeasurement> throughput_measurements_;
+
+    // Per-thread fast-path samples. Each thread registers a shared_ptr which
+    // is kept by the measurement registry to allow reading after threads
+    // exit (useful in test harnesses). Access to the registry is protected
+    // by registry_mutex_. Recording goes to thread-local storage with a
+    // light lock in the thread-local structure.
+    struct ThreadSampleStore {
+        std::mutex lock;
+        std::unordered_map<std::string, std::vector<Duration>> samples;
+    };
+
+    mutable std::mutex registry_mutex_;
+    std::vector<std::shared_ptr<ThreadSampleStore>> thread_stores_;
     
     // Continuous monitoring
     std::atomic<bool> monitoring_active_{false};

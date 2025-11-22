@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <iostream>
+#include <limits>
 
 namespace orderbook {
 
@@ -24,6 +25,12 @@ OrderBook::OrderBook(RiskManagerPtr risk_manager,
 
     // Start processing thread
     processing_thread_ = std::thread(&OrderBook::processLoop, this);
+
+    // Initialize sharded market queues
+    market_queues_.reserve(MarketDataQueueCount);
+    for (size_t i = 0; i < MarketDataQueueCount; ++i) {
+        market_queues_.emplace_back(std::make_unique<boost::lockfree::spsc_queue<MarketUpdate, boost::lockfree::capacity<MarketDataQueueCapacity>>>());
+    }
 }
 
 OrderBook::~OrderBook() {
@@ -76,7 +83,7 @@ void OrderBook::processLoop() {
             lock.unlock();
 
             switch (cmd.type) {
-                case Command::Type::Add:
+                    case Command::Type::Add:
                     if (cmd.order) {
                         processAddOrder(std::move(cmd.order));
                     }
@@ -104,7 +111,8 @@ void OrderBook::applyExternalMarketData(const MarketDepth& depth) {
     // Push clear message first
     MarketUpdate clear_msg;
     clear_msg.type = MarketUpdate::Type::SnapshotStart;
-    market_queue_.push(clear_msg);
+    // route to per-thread queue
+    market_queues_[getProducerQueueIndex()]->push(clear_msg);
 
     // Push all bids
     for (const auto& level : depth.bids) {
@@ -114,7 +122,7 @@ void OrderBook::applyExternalMarketData(const MarketDepth& depth) {
         update.price = level.price;
         update.quantity = level.quantity;
         update.order_count = level.order_count;
-        market_queue_.push(update);
+        market_queues_[getProducerQueueIndex()]->push(update);
     }
 
     // Push all asks
@@ -125,7 +133,7 @@ void OrderBook::applyExternalMarketData(const MarketDepth& depth) {
         update.price = level.price;
         update.quantity = level.quantity;
         update.order_count = level.order_count;
-        market_queue_.push(update);
+        market_queues_[getProducerQueueIndex()]->push(update);
     }
 }
 
@@ -140,17 +148,18 @@ void OrderBook::applyExternalBookUpdate(const BookUpdate& update) {
     mu.quantity = update.quantity;
     mu.order_count = update.order_count;
     
-    market_queue_.push(mu);
+    market_queues_[getProducerQueueIndex()]->push(mu);
 }
 
 void OrderBook::clearBook() {
     MarketUpdate mu;
     mu.type = MarketUpdate::Type::SnapshotStart;
-    market_queue_.push(mu);
+    market_queues_[getProducerQueueIndex()]->push(mu);
 }
 
 // Core operations
 OrderResult OrderBook::addOrder(const Order& order) {
+    PERF_MEASURE_SCOPE("OrderBook::addOrder");
     // Create a copy of the order for processing
     auto order_copy = std::make_unique<Order>(order.id.value, order.side, order.type, order.price, order.quantity, order.symbol);
     order_copy->timestamp = std::chrono::system_clock::now();
@@ -170,10 +179,9 @@ OrderResult OrderBook::addOrder(const Order& order) {
 }
 
 void OrderBook::processAddOrder(std::unique_ptr<Order> order_ptr) {
-    // PERF_TIMER("OrderBook::processAddOrder", logger_);
-    // PERF_MEASURE("OrderBook::processAddOrder");
+    PERF_MEASURE_SCOPE("OrderBook::processAddOrder");
     
-    if (logger_) {
+    if (logger_ && logger_->isLogLevelEnabled(LogLevel::DEBUG)) {
         logger_->debug("Processing Add Order ID: " + std::to_string(order_ptr->id.value) + 
                       " Side: " + (order_ptr->side == Side::Buy ? "Buy" : "Sell") +
                       " Price: " + std::to_string(order_ptr->price) +
@@ -198,7 +206,7 @@ void OrderBook::processAddOrder(std::unique_ptr<Order> order_ptr) {
             return;
         }
         
-        if (logger_) {
+        if (logger_ && logger_->isLogLevelEnabled(LogLevel::DEBUG)) {
             logger_->debug("Order passed risk validation: " + risk_check.reason, 
                           "OrderBook::processAddOrder - OrderID: " + std::to_string(order_ptr->id.value) + 
                           " Account: " + account);
@@ -232,6 +240,8 @@ void OrderBook::processAddOrder(std::unique_ptr<Order> order_ptr) {
     OrderLocation location(order_ptr.get(), price_level, order_ptr->side);
     order_index_[order_ptr->id] = location;
     
+    // Move pooled object to book ownership so it remains allocated until removed
+    // Move unique_ptr into order_index ownership; it will be freed on removal
     // Release ownership - order is now managed by price level
     Order* order_raw = order_ptr.release();
     
@@ -271,7 +281,12 @@ void OrderBook::processAddOrder(std::unique_ptr<Order> order_ptr) {
             
             // Clean up empty price level
             if (price_level->isEmpty()) {
-                removePriceLevel(price_level, order_raw->side);
+                // The level may have already been removed by matching. Check the
+                // price index to ensure the pointer is still valid before removal.
+                auto p_it = price_index_.find(order_raw->price);
+                if (p_it != price_index_.end() && p_it->second == price_level) {
+                    removePriceLevel(price_level, order_raw->side);
+                }
             }
             
             // Remove from order index
@@ -304,6 +319,7 @@ void OrderBook::processAddOrder(std::unique_ptr<Order> order_ptr) {
 }
 
 CancelResult OrderBook::cancelOrder(OrderId id) {
+    PERF_MEASURE_SCOPE("OrderBook::cancelOrder");
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         Command cmd;
@@ -316,10 +332,9 @@ CancelResult OrderBook::cancelOrder(OrderId id) {
 }
 
 void OrderBook::processCancelOrder(OrderId id) {
-    // PERF_TIMER("OrderBook::processCancelOrder", logger_);
-    // PERF_MEASURE("OrderBook::processCancelOrder");
+    PERF_MEASURE_SCOPE("OrderBook::processCancelOrder");
     
-    if (logger_) {
+    if (logger_ && logger_->isLogLevelEnabled(LogLevel::DEBUG)) {
         logger_->debug("Processing Cancel Order ID: " + std::to_string(id.value), "OrderBook::processCancelOrder");
     }
     
@@ -350,16 +365,19 @@ void OrderBook::processCancelOrder(OrderId id) {
     publishBookUpdate(BookUpdate::Type::Remove, order_side, order_price, 
                      remaining_qty, location.price_level->order_count);
     
-    // Clean up empty price level
+    // Clean up empty price level (guard against double removal by another path)
     if (location.price_level->isEmpty()) {
-        removePriceLevel(location.price_level, location.side);
+        auto p_it = price_index_.find(location.price_level->price);
+        if (p_it != price_index_.end() && p_it->second == location.price_level) {
+            removePriceLevel(location.price_level, location.side);
+        }
     }
     
+    // Return pooled order to pool by erasing the pooled object entry
+    delete location.order;
+
     // Remove from order index
     order_index_.erase(it);
-    
-    // Delete the order
-    delete location.order;
     
     // Publish market data update (best prices and depth)
     publishMarketDataUpdate();
@@ -371,6 +389,7 @@ void OrderBook::processCancelOrder(OrderId id) {
 }
 
 ModifyResult OrderBook::modifyOrder(OrderId id, Price new_price, Quantity new_quantity) {
+    PERF_MEASURE_SCOPE("OrderBook::modifyOrder");
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         Command cmd;
@@ -385,10 +404,9 @@ ModifyResult OrderBook::modifyOrder(OrderId id, Price new_price, Quantity new_qu
 }
 
 void OrderBook::processModifyOrder(OrderId id, Price new_price, Quantity new_quantity) {
-    // PERF_TIMER("OrderBook::processModifyOrder", logger_);
-    // PERF_MEASURE("OrderBook::processModifyOrder");
+    PERF_MEASURE_SCOPE("OrderBook::processModifyOrder");
     
-    if (logger_) {
+    if (logger_ && logger_->isLogLevelEnabled(LogLevel::DEBUG)) {
         logger_->debug("Processing Modify Order ID: " + std::to_string(id.value) +
                       " New Price: " + std::to_string(new_price) +
                       " New Quantity: " + std::to_string(new_quantity), "OrderBook::processModifyOrder");
@@ -422,7 +440,10 @@ void OrderBook::processModifyOrder(OrderId id, Price new_price, Quantity new_qua
         
         // Clean up empty price level
         if (location.price_level->isEmpty()) {
-            removePriceLevel(location.price_level, location.side);
+            auto p_it = price_index_.find(location.price_level->price);
+            if (p_it != price_index_.end() && p_it->second == location.price_level) {
+                removePriceLevel(location.price_level, location.side);
+            }
         }
         
         // Update order price
@@ -481,7 +502,7 @@ void OrderBook::processModifyOrder(OrderId id, Price new_price, Quantity new_qua
 
 // Market data queries with O(1) performance
 std::optional<Price> OrderBook::bestBid() const {
-    // PERF_MEASURE("OrderBook::bestBid");
+    PERF_MEASURE("OrderBook::bestBid");
     if (bids_.empty()) {
         return std::nullopt;
     }
@@ -490,7 +511,7 @@ std::optional<Price> OrderBook::bestBid() const {
 }
 
 std::optional<Price> OrderBook::bestAsk() const {
-    // PERF_MEASURE("OrderBook::bestAsk");
+    PERF_MEASURE("OrderBook::bestAsk");
     if (asks_.empty()) {
         return std::nullopt;
     }
@@ -849,7 +870,7 @@ void OrderBook::matchAgainstPriceLevel(Order& incoming_order, PriceLevel& price_
                 order_index_.erase(it);
             }
             
-            // Delete the filled order
+            // Return pooled order to pool
             delete current_order;
             current_order = next_order;
         }
@@ -858,7 +879,10 @@ void OrderBook::matchAgainstPriceLevel(Order& incoming_order, PriceLevel& price_
     // Clean up empty price level
     if (price_level.isEmpty()) {
         Side opposite_side = (incoming_order.side == Side::Buy) ? Side::Sell : Side::Buy;
-        removePriceLevel(&price_level, opposite_side);
+        auto p_it = price_index_.find(price_level.price);
+        if (p_it != price_index_.end() && p_it->second == &price_level) {
+            removePriceLevel(&price_level, opposite_side);
+        }
     }
 }
 
@@ -893,6 +917,9 @@ void OrderBook::executeTrade(Order& aggressive_order, Order& passive_order,
     if (market_data_) {
         market_data_->publishTrade(trade);
     }
+
+    // Always increment our internal trade counter so benchmarks can read it
+    trade_count_.fetch_add(1u, std::memory_order_relaxed);
     
     // Log trade execution with risk context
     if (logger_) {
@@ -923,7 +950,13 @@ void OrderBook::executeTrade(Order& aggressive_order, Order& passive_order,
 
 void OrderBook::poll() {
     MarketUpdate update;
-    while (market_queue_.pop(update)) {
+    // Drain all sharded market queues. Loop until no queue had updates.
+    bool any_popped = true;
+    while (any_popped) {
+        any_popped = false;
+        for (auto& qptr : market_queues_) {
+            while (qptr->pop(update)) {
+                any_popped = true;
         if (update.type == MarketUpdate::Type::SnapshotStart) {
             // Clear book logic
             for (auto& level : bids_) {
@@ -976,7 +1009,21 @@ void OrderBook::poll() {
         
         // No sort required; maintainSortedOrder() can be expensive under heavy update load
         publishMarketDataUpdate();
+            }
+        }
     }
+}
+
+size_t OrderBook::getProducerQueueIndex() {
+    static thread_local size_t local_index = std::numeric_limits<size_t>::max();
+    if (local_index == std::numeric_limits<size_t>::max()) {
+        local_index = producer_rr_index_.fetch_add(1u) % market_queues_.size();
+    }
+    return local_index;
+}
+
+uint64_t OrderBook::getTradeCount() const {
+    return trade_count_.load(std::memory_order_relaxed);
 }
 
 } // namespace orderbook

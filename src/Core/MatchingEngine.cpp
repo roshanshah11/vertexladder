@@ -2,6 +2,7 @@
 #include "orderbook/Core/Order.hpp"
 #include "orderbook/Core/MarketData.hpp"
 #include "orderbook/Utilities/PerformanceTimer.hpp"
+#include "orderbook/Utilities/PerformanceMeasurement.hpp"
 #include <chrono>
 #include <algorithm>
 
@@ -16,7 +17,7 @@ MatchingEngine::MatchingEngine(LoggerPtr logger)
 
 MatchResult MatchingEngine::matchOrder(Order& incoming_order, 
                                       std::vector<PriceLevel>& opposite_side_levels) {
-    PERF_TIMER("MatchingEngine::matchOrder", logger_);
+    PERF_MEASURE_SCOPE("MatchingEngine::matchOrder");
     auto start_time = std::chrono::high_resolution_clock::now();
     
     MatchResult result;
@@ -32,13 +33,18 @@ MatchResult MatchingEngine::matchOrder(Order& incoming_order,
         auto end_time = std::chrono::high_resolution_clock::now();
         auto latency_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
             end_time - start_time).count();
-        
-        logger_->logPerformance("order_matching", latency_ns, {
-            {"order_id", std::to_string(incoming_order.id.value)},
-            {"trades_generated", std::to_string(result.getTradeCount())},
-            {"quantity_filled", std::to_string(result.total_filled_quantity)},
-            {"fully_filled", result.fully_filled ? "true" : "false"}
-        });
+
+        // Record to in-memory measurement for harness
+        orderbook::PerformanceMeasurement::getInstance().recordLatency("MatchingEngine::matchOrder", orderbook::PerformanceMeasurement::Duration(latency_ns));
+
+        if (logger_->isLogLevelEnabled(LogLevel::INFO)) {
+            logger_->logPerformance("order_matching", latency_ns, {
+                {"order_id", std::to_string(incoming_order.id.value)},
+                {"trades_generated", std::to_string(result.getTradeCount())},
+                {"quantity_filled", std::to_string(result.total_filled_quantity)},
+                {"fully_filled", result.fully_filled ? "true" : "false"}
+            });
+        }
     }
     
     return result;
@@ -48,7 +54,7 @@ MatchResult MatchingEngine::matchBuyOrder(Order& buy_order,
                                          std::vector<PriceLevel>& ask_levels) {
     MatchResult result;
     
-    if (logger_) {
+    if (logger_ && logger_->isLogLevelEnabled(LogLevel::DEBUG)) {
         logger_->debug("Matching buy order " + std::to_string(buy_order.id.value) + 
                       " price=" + std::to_string(buy_order.price) + 
                       " qty=" + std::to_string(buy_order.remainingQuantity()),
@@ -101,7 +107,7 @@ MatchResult MatchingEngine::matchBuyOrder(Order& buy_order,
         result.fully_filled = true;
     }
     
-    if (logger_ && result.hasTrades()) {
+    if (logger_ && result.hasTrades() && logger_->isLogLevelEnabled(LogLevel::INFO)) {
         logger_->info("Buy order matching completed: " + 
                      std::to_string(result.getTradeCount()) + " trades, " +
                      std::to_string(result.total_filled_quantity) + " quantity filled, " +
@@ -116,7 +122,7 @@ MatchResult MatchingEngine::matchSellOrder(Order& sell_order,
                                           std::vector<PriceLevel>& bid_levels) {
     MatchResult result;
     
-    if (logger_) {
+    if (logger_ && logger_->isLogLevelEnabled(LogLevel::DEBUG)) {
         logger_->debug("Matching sell order " + std::to_string(sell_order.id.value) + 
                       " price=" + std::to_string(sell_order.price) + 
                       " qty=" + std::to_string(sell_order.remainingQuantity()),
@@ -169,7 +175,7 @@ MatchResult MatchingEngine::matchSellOrder(Order& sell_order,
         result.fully_filled = true;
     }
     
-    if (logger_ && result.hasTrades()) {
+    if (logger_ && result.hasTrades() && logger_->isLogLevelEnabled(LogLevel::INFO)) {
         logger_->info("Sell order matching completed: " + 
                      std::to_string(result.getTradeCount()) + " trades, " +
                      std::to_string(result.total_filled_quantity) + " quantity filled, " +
@@ -226,6 +232,7 @@ Trade MatchingEngine::executeTrade(Order& aggressive_order,
                                   Order& passive_order,
                                   Price trade_price, 
                                   Quantity trade_quantity) {
+    PERF_MEASURE_SCOPE("MatchingEngine::executeTrade");
     auto start_time = std::chrono::high_resolution_clock::now();
     
     // Fill both orders
@@ -247,6 +254,8 @@ Trade MatchingEngine::executeTrade(Order& aggressive_order,
     auto latency_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         end_time - start_time).count();
     
+    // Record to in-memory measurement
+    orderbook::PerformanceMeasurement::getInstance().recordLatency("MatchingEngine::executeTrade", orderbook::PerformanceMeasurement::Duration(latency_ns));
     logTradeExecution(trade, latency_ns);
     
     return trade;
@@ -258,21 +267,28 @@ TradeId MatchingEngine::getNextTradeId() {
 
 void MatchingEngine::logTradeExecution(const Trade& trade, uint64_t latency_ns) {
     if (!logger_) return;
-    
-    logger_->info("Trade executed: ID=" + std::to_string(trade.id.value) + 
-                 " Buy=" + std::to_string(trade.buy_order_id.value) + 
-                 " Sell=" + std::to_string(trade.sell_order_id.value) + 
-                 " Price=" + std::to_string(trade.price) + 
-                 " Qty=" + std::to_string(trade.quantity) + 
-                 " Symbol=" + trade.symbol,
-                 "MatchingEngine::executeTrade");
-    
-    logger_->logPerformance("trade_execution", latency_ns, {
-        {"trade_id", std::to_string(trade.id.value)},
-        {"price", std::to_string(trade.price)},
-        {"quantity", std::to_string(trade.quantity)},
-        {"symbol", trade.symbol}
-    });
+
+    if (logger_->isLogLevelEnabled(LogLevel::INFO)) {
+        logger_->info("Trade executed: ID=" + std::to_string(trade.id.value) + 
+                     " Buy=" + std::to_string(trade.buy_order_id.value) + 
+                     " Sell=" + std::to_string(trade.sell_order_id.value) + 
+                     " Price=" + std::to_string(trade.price) + 
+                     " Qty=" + std::to_string(trade.quantity) + 
+                     " Symbol=" + trade.symbol,
+                     "MatchingEngine::executeTrade");
+    }
+
+    // Record in-memory latency for performance checking
+    orderbook::PerformanceMeasurement::getInstance().recordLatency("trade_execution", orderbook::PerformanceMeasurement::Duration(latency_ns));
+
+    if (logger_->isLogLevelEnabled(LogLevel::INFO)) {
+        logger_->logPerformance("trade_execution", latency_ns, {
+            {"trade_id", std::to_string(trade.id.value)},
+            {"price", std::to_string(trade.price)},
+            {"quantity", std::to_string(trade.quantity)},
+            {"symbol", trade.symbol}
+        });
+    }
 }
 
 bool MatchingEngine::validateTrade(const Order& aggressive_order,
