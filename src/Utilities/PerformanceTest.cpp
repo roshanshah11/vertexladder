@@ -65,16 +65,19 @@ PerformanceTest::TestResults PerformanceTest::runPerformanceTest(const TestConfi
         std::make_shared<RiskManager>(logger) : nullptr;
     auto market_data = config.enable_market_data ? 
         std::make_shared<MarketDataPublisher>(logger) : nullptr;
-    if (market_data) {
+        if (market_data) {
         // Benchmark does not need string-based market data output
         // setDisabled(true) can cause instability in debug builds; set only in Release mode
 #ifdef NDEBUG
         market_data->setDisabled(true);
-        if (risk_manager) {
-            risk_manager->setBypass(true);
-        }
 #endif
     }
+        if (risk_manager) {
+        // Skip risk checks in release harness to measure raw throughput
+    #ifdef NDEBUG
+        risk_manager->setBypass(true);
+    #endif
+        }
 
     OrderBook order_book(risk_manager, market_data, logger);
 

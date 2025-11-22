@@ -82,15 +82,34 @@ private:
     struct Command {
         enum class Type { Add, Cancel, Modify };
         Type type;
-        // Use pooled objects for high-performance allocation
+        // For compatibility but we use OrderRequest queues for production
         std::unique_ptr<Order> order;
         OrderId order_id;
         Price price;
         Quantity quantity;
     };
 
-    // Command queue for thread safety
-    std::queue<Command> command_queue_;
+    // OrderRequest used for lock-free per-thread SPSC ingestion
+    struct OrderRequest {
+        enum class Type { Add, Cancel, Modify } type;
+        // Minimal POD fields to avoid allocations on producer hot-path
+        OrderId id{0};
+        Side side{Side::Buy};
+        OrderType order_type{OrderType::Limit};
+        Price price{0};
+        Quantity quantity{0};
+        // Fixed-size symbol/account buffers to avoid std::string allocations
+        char symbol[32];
+        char account[32];
+        int tif{0};
+    };
+
+    // Sharded SPSC queues for orders to avoid global producer mutex contention
+    static constexpr size_t OrderQueueCount = 4;
+    static constexpr size_t OrderQueueCapacity = 100000;
+    std::vector<std::unique_ptr<boost::lockfree::spsc_queue<OrderRequest, boost::lockfree::capacity<OrderQueueCapacity>>>> order_queues_;
+    std::atomic<size_t> order_producer_rr_index_{0};
+    std::atomic<bool> order_data_available_{false};
     mutable std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
     std::thread processing_thread_;
@@ -145,6 +164,7 @@ private:
 
     // Get a deterministic, thread-affine queue index for producers
     size_t getProducerQueueIndex();
+    size_t getOrderQueueIndex();
     
     // Constants
     static constexpr size_t InitialCapacity = 1024;

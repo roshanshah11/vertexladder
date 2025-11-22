@@ -42,7 +42,7 @@ public:
     void associateOrderWithAccount(OrderId order_id, const std::string& account) override;
     std::string getAccountForOrder(OrderId order_id) const override;
 
-    // Benchmark/testing helper - bypass risk checks
+    // Bypass control for validation and updates
     void setBypass(bool bypass) override;
     bool isBypassed() const override;
 

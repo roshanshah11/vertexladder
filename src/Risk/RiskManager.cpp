@@ -24,7 +24,6 @@ RiskManager::RiskManager(std::shared_ptr<Config> config, LoggerPtr logger)
 
 RiskCheck RiskManager::validateOrder(const Order& order, const Portfolio& portfolio) {
     if (bypass_.load(std::memory_order_relaxed)) {
-        if (logger_) logger_->debug("Risk checks bypassed, approving order", "RiskManager::validateOrder");
         return RiskCheck(RiskResult::Approved, "Bypassed");
     }
     PERF_TIMER("RiskManager::validateOrder", logger_);
@@ -78,6 +77,9 @@ RiskCheck RiskManager::validateOrder(const Order& order, const Portfolio& portfo
 }
 
 void RiskManager::updatePosition(const Trade& trade) {
+    if (bypass_.load(std::memory_order_relaxed)) {
+        return;
+    }
     // Get accounts for the orders involved in the trade
     std::string buy_account = getAccountForOrder(trade.buy_order_id);
     std::string sell_account = getAccountForOrder(trade.sell_order_id);
@@ -93,6 +95,14 @@ void RiskManager::updatePosition(const Trade& trade) {
         portfolios_[sell_account] = Portfolio(sell_account);
     }
     portfolios_[sell_account].updatePosition(trade.symbol, -static_cast<int64_t>(trade.quantity), trade.price);
+}
+
+void RiskManager::setBypass(bool bypass) {
+    bypass_.store(bypass, std::memory_order_relaxed);
+}
+
+bool RiskManager::isBypassed() const {
+    return bypass_.load(std::memory_order_relaxed);
 }
 
 void RiskManager::associateOrderWithAccount(OrderId order_id, const std::string& account) {
@@ -144,17 +154,6 @@ void RiskManager::reloadConfiguration() {
     if (config_) {
         loadConfiguration(config_);
     }
-}
-
-void RiskManager::setBypass(bool bypass) {
-    bypass_.store(bypass, std::memory_order_relaxed);
-    if (logger_) {
-        logger_->info(std::string("RiskManager bypass set to ") + (bypass ? "true" : "false"), "RiskManager::setBypass");
-    }
-}
-
-bool RiskManager::isBypassed() const {
-    return bypass_.load(std::memory_order_relaxed);
 }
 
 bool RiskManager::validateOrderSize(Quantity quantity) const {

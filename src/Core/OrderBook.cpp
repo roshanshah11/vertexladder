@@ -31,6 +31,11 @@ OrderBook::OrderBook(RiskManagerPtr risk_manager,
     for (size_t i = 0; i < MarketDataQueueCount; ++i) {
         market_queues_.emplace_back(std::make_unique<boost::lockfree::spsc_queue<MarketUpdate, boost::lockfree::capacity<MarketDataQueueCapacity>>>());
     }
+    // Initialize sharded order queues
+    order_queues_.reserve(OrderQueueCount);
+    for (size_t i = 0; i < OrderQueueCount; ++i) {
+        order_queues_.emplace_back(std::make_unique<boost::lockfree::spsc_queue<OrderRequest, boost::lockfree::capacity<OrderQueueCapacity>>>());
+    }
 }
 
 OrderBook::~OrderBook() {
@@ -47,18 +52,18 @@ OrderBook::~OrderBook() {
 void OrderBook::waitForCompletion() {
     int wait_count = 0;
     while (true) {
-        size_t queue_size = 0;
-        {
-            std::lock_guard<std::mutex> lock(queue_mutex_);
-            if (command_queue_.empty()) {
-                break;
-            }
-            queue_size = command_queue_.size();
+        bool any_pending = false;
+        // Check order queues for any remaining work
+        for (auto& qptr : order_queues_) {
+            if (!qptr->empty()) { any_pending = true; break; }
         }
+        if (!any_pending) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         wait_count++;
         if (wait_count % 10 == 0) {
-            std::cout << "Waiting for completion... Queue size: " << queue_size << std::endl;
+            size_t non_empty_shards = 0;
+            for (auto& qptr : order_queues_) if (!qptr->empty()) ++non_empty_shards;
+            std::cout << "Waiting for completion... Non-empty order shards: " << non_empty_shards << std::endl;
         }
     }
     // Give a little time for the last item to be processed
@@ -70,39 +75,48 @@ void OrderBook::processLoop() {
     std::cout << "Consumer thread started" << std::endl;
     while (running_) {
         std::unique_lock<std::mutex> lock(queue_mutex_);
-        queue_cv_.wait(lock, [this] { return !command_queue_.empty() || !running_; });
+        queue_cv_.wait(lock, [this] { return order_data_available_.load(std::memory_order_acquire) || !running_; });
 
-        if (!running_ && command_queue_.empty()) {
+        if (!running_ && !order_data_available_.load(std::memory_order_acquire)) {
             std::cout << "Consumer thread stopping" << std::endl;
             return;
         }
+        lock.unlock();
 
-        while (!command_queue_.empty()) {
-            Command cmd = std::move(command_queue_.front());
-            command_queue_.pop();
-            lock.unlock();
-
-            switch (cmd.type) {
-                    case Command::Type::Add:
-                    if (cmd.order) {
-                        processAddOrder(std::move(cmd.order));
+        // Drain all order queues (sharded). We'll process all available requests.
+        OrderRequest req;
+        bool any_processed = true;
+        while (any_processed) {
+            any_processed = false;
+            for (auto& qptr : order_queues_) {
+                while (qptr->pop(req)) {
+                    any_processed = true;
+                    switch (req.type) {
+                        case OrderRequest::Type::Add: {
+                            // Construct Order on consumer side to avoid producer allocation
+                            Order* created = new Order(req.id.value, req.side, req.order_type, req.price, req.quantity, std::string(req.symbol));
+                            created->account = std::string(req.account);
+                            created->tif = static_cast<TimeInForce>(req.tif);
+                            std::unique_ptr<Order> o(created);
+                            processAddOrder(std::move(o));
+                            break;
+                        }
+                        case OrderRequest::Type::Cancel: {
+                            processCancelOrder(req.id);
+                            break;
+                        }
+                        case OrderRequest::Type::Modify: {
+                            processModifyOrder(req.id, req.price, req.quantity);
+                            break;
+                        }
                     }
-                    break;
-                case Command::Type::Cancel:
-                    processCancelOrder(cmd.order_id);
-                    break;
-                case Command::Type::Modify:
-                    processModifyOrder(cmd.order_id, cmd.price, cmd.quantity);
-                    break;
+                    processed_count++;
+                    if (processed_count % 10000 == 0) std::cout << "Consumer processed " << processed_count << " commands" << std::endl;
+                }
             }
-            
-            processed_count++;
-            if (processed_count % 10000 == 0) {
-                std::cout << "Consumer processed " << processed_count << " commands" << std::endl;
-            }
-
-            lock.lock();
         }
+        // Mark processed flag reset
+        order_data_available_.store(false, std::memory_order_release);
     }
     std::cout << "Consumer thread exited loop" << std::endl;
 }
@@ -160,34 +174,21 @@ void OrderBook::clearBook() {
 // Core operations
 OrderResult OrderBook::addOrder(const Order& order) {
     PERF_MEASURE_SCOPE("OrderBook::addOrder");
-    // If risk manager is configured and not bypassed, perform a fast pre-validation
-    // before acquiring the command queue lock to avoid blocking producers with a
-    // potentially long-running validation.
-    if (risk_manager_ && !risk_manager_->isBypassed()) {
-        std::string account = order.account.empty() ? "default" : order.account;
-        const Portfolio& portfolio = risk_manager_->getPortfolio(account);
-        auto risk_check = risk_manager_->validateOrder(order, portfolio);
-        if (risk_check.isRejected()) {
-            if (logger_) {
-                logger_->error("Order rejected by risk manager before enqueue: " + risk_check.reason,
-                               "OrderBook::addOrder - OrderID: " + std::to_string(order.id.value));
-            }
-            return OrderResult::error("Rejected by risk");
-        }
-    }
-    // Create a copy of the order for processing
-    auto order_copy = std::make_unique<Order>(order.id.value, order.side, order.type, order.price, order.quantity, order.symbol);
-    order_copy->timestamp = std::chrono::system_clock::now();
-    order_copy->account = order.account;
-    order_copy->tif = order.tif;
-
-    {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        Command cmd;
-        cmd.type = Command::Type::Add;
-        cmd.order = std::move(order_copy);
-        command_queue_.push(std::move(cmd));
-    }
+    // Create a lightweight request (POD) and copy only small fields to avoid allocations on the producer
+    OrderRequest req{};
+    req.type = OrderRequest::Type::Add;
+    req.id = order.id;
+    req.side = order.side;
+    req.order_type = order.type;
+    req.price = order.price;
+    req.quantity = order.quantity;
+    std::memset(req.symbol, 0, sizeof(req.symbol));
+    std::memset(req.account, 0, sizeof(req.account));
+    std::strncpy(req.symbol, order.symbol.c_str(), sizeof(req.symbol) - 1);
+    std::strncpy(req.account, order.account.c_str(), sizeof(req.account) - 1);
+    req.tif = static_cast<int>(order.tif);
+    order_queues_[getOrderQueueIndex()]->push(req);
+    order_data_available_.store(true, std::memory_order_release);
     queue_cv_.notify_one();
 
     return OrderResult::success(order.id);
@@ -195,6 +196,8 @@ OrderResult OrderBook::addOrder(const Order& order) {
 
 void OrderBook::processAddOrder(std::unique_ptr<Order> order_ptr) {
     PERF_MEASURE_SCOPE("OrderBook::processAddOrder");
+    // Assign timestamp here on consumer side to avoid syscalls on producer hot path
+    order_ptr->timestamp = std::chrono::system_clock::now();
     
     if (logger_ && logger_->isLogLevelEnabled(LogLevel::DEBUG)) {
         logger_->debug("Processing Add Order ID: " + std::to_string(order_ptr->id.value) + 
@@ -205,14 +208,15 @@ void OrderBook::processAddOrder(std::unique_ptr<Order> order_ptr) {
     
     // Risk validation if risk manager is available
     if (risk_manager_) {
-        // Associate order with account
-        std::string account = order_ptr->account.empty() ? "default" : order_ptr->account;
-        risk_manager_->associateOrderWithAccount(order_ptr->id, account);
-        
-        // Get the portfolio for the order's account
-        const Portfolio& portfolio = risk_manager_->getPortfolio(account);
-        auto risk_check = risk_manager_->validateOrder(*order_ptr, portfolio);
-        if (risk_check.isRejected()) {
+        if (!risk_manager_->isBypassed()) {
+            // Associate order with account
+            std::string account = order_ptr->account.empty() ? "default" : order_ptr->account;
+            risk_manager_->associateOrderWithAccount(order_ptr->id, account);
+            
+            // Get the portfolio for the order's account
+            const Portfolio& portfolio = risk_manager_->getPortfolio(account);
+            auto risk_check = risk_manager_->validateOrder(*order_ptr, portfolio);
+            if (risk_check.isRejected()) {
             if (logger_) {
                 logger_->error("Order rejected by risk manager: " + risk_check.reason, 
                               "OrderBook::processAddOrder - OrderID: " + std::to_string(order_ptr->id.value) + 
@@ -221,10 +225,13 @@ void OrderBook::processAddOrder(std::unique_ptr<Order> order_ptr) {
             return;
         }
         
-        if (logger_ && logger_->isLogLevelEnabled(LogLevel::DEBUG)) {
-            logger_->debug("Order passed risk validation: " + risk_check.reason, 
-                          "OrderBook::processAddOrder - OrderID: " + std::to_string(order_ptr->id.value) + 
-                          " Account: " + account);
+            if (logger_ && logger_->isLogLevelEnabled(LogLevel::DEBUG)) {
+                logger_->debug("Order passed risk validation: " + risk_check.reason, 
+                              "OrderBook::processAddOrder - OrderID: " + std::to_string(order_ptr->id.value) + 
+                              " Account: " + account);
+            }
+        } else {
+            // Bypassed - skip validation and association for maximum throughput
         }
     }
     
@@ -335,13 +342,11 @@ void OrderBook::processAddOrder(std::unique_ptr<Order> order_ptr) {
 
 CancelResult OrderBook::cancelOrder(OrderId id) {
     PERF_MEASURE_SCOPE("OrderBook::cancelOrder");
-    {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        Command cmd;
-        cmd.type = Command::Type::Cancel;
-        cmd.order_id = id;
-        command_queue_.push(std::move(cmd));
-    }
+    OrderRequest req;
+    req.type = OrderRequest::Type::Cancel;
+    req.id = id;
+    order_queues_[getOrderQueueIndex()]->push(req);
+    order_data_available_.store(true, std::memory_order_release);
     queue_cv_.notify_one();
     return CancelResult::success(true);
 }
@@ -405,15 +410,13 @@ void OrderBook::processCancelOrder(OrderId id) {
 
 ModifyResult OrderBook::modifyOrder(OrderId id, Price new_price, Quantity new_quantity) {
     PERF_MEASURE_SCOPE("OrderBook::modifyOrder");
-    {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        Command cmd;
-        cmd.type = Command::Type::Modify;
-        cmd.order_id = id;
-        cmd.price = new_price;
-        cmd.quantity = new_quantity;
-        command_queue_.push(std::move(cmd));
-    }
+    OrderRequest req;
+    req.type = OrderRequest::Type::Modify;
+    req.id = id;
+    req.price = new_price;
+    req.quantity = new_quantity;
+    order_queues_[getOrderQueueIndex()]->push(req);
+    order_data_available_.store(true, std::memory_order_release);
     queue_cv_.notify_one();
     return ModifyResult::success(true);
 }
@@ -1033,6 +1036,14 @@ size_t OrderBook::getProducerQueueIndex() {
     static thread_local size_t local_index = std::numeric_limits<size_t>::max();
     if (local_index == std::numeric_limits<size_t>::max()) {
         local_index = producer_rr_index_.fetch_add(1u) % market_queues_.size();
+    }
+    return local_index;
+}
+
+size_t OrderBook::getOrderQueueIndex() {
+    static thread_local size_t local_index = std::numeric_limits<size_t>::max();
+    if (local_index == std::numeric_limits<size_t>::max()) {
+        local_index = order_producer_rr_index_.fetch_add(1u) % order_queues_.size();
     }
     return local_index;
 }
