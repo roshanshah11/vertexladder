@@ -16,7 +16,7 @@ public:
      * @brief Test configuration
      */
     struct TestConfig {
-        size_t num_orders = 100000;
+        size_t num_orders = 1000000;
         size_t num_threads = 1;
         double buy_sell_ratio = 0.5;
         Price min_price = 100.0;

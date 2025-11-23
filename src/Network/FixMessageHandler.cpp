@@ -260,8 +260,8 @@ std::unique_ptr<Order> FixMessageHandler::convertToInternalOrder(const FixMessag
             newOrder.timeInForce,
             newOrder.price,
             newOrder.quantity,
-            newOrder.symbol,
-            newOrder.account
+            newOrder.symbol.c_str(),
+            newOrder.account.c_str()
         );
         
         return order;

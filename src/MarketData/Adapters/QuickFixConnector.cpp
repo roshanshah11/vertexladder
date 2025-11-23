@@ -3,6 +3,7 @@
 #include "orderbook/MarketData/MarketDataFeed.hpp"
 #include "orderbook/OrderBook.hpp"
 #include <quickfix/fix44/MarketDataIncrementalRefresh.h>
+#include <quickfix/fix44/MarketDataRequest.h>
 #include <quickfix/fix44/SequenceReset.h>
 #include <quickfix/fix44/MarketDataRequestReject.h>
 #include <quickfix/SessionSettings.h>
@@ -40,30 +41,13 @@ QuickFixConnector::~QuickFixConnector() {
 
 bool QuickFixConnector::start() {
     try {
-        if (logger_) logger_->info("Loading QuickFIX config manually (bypass file)", "QuickFixConnector::start");
+        if (logger_) logger_->info("Loading QuickFIX config from: " + quickfix_config_path_, "QuickFixConnector::start");
         
-        FIX::SessionSettings settings;
-        FIX::Dictionary defaults;
-        defaults.setString("ConnectionType", "initiator");
-        defaults.setString("StartTime", "00:00:00");
-        defaults.setString("EndTime", "00:00:00");
-        defaults.setString("HeartBtInt", "30");
-        defaults.setString("ReconnectInterval", "5");
-        defaults.setString("FileStorePath", "store");
-        defaults.setString("FileLogPath", "log");
-        defaults.setString("UseDataDictionary", "Y");
-        defaults.setString("DataDictionary", "third_party/fix/FIX44.xml");
-        settings.set(defaults);
+        settings_ = FIX::SessionSettings(quickfix_config_path_);
 
-        FIX::SessionID sessionID("FIX.4.4", "ORDERBOOK", "MDPI");
-        FIX::Dictionary sessionDict;
-        sessionDict.setString("SocketConnectHost", "127.0.0.1");
-        sessionDict.setString("SocketConnectPort", "9876");
-        settings.set(sessionID, sessionDict);
-
-        store_factory_.reset(new FIX::FileStoreFactory(settings));
-        log_factory_.reset(new FIX::FileLogFactory(settings));
-        initiator_.reset(new FIX::SocketInitiator(*this, *store_factory_, settings, *log_factory_));
+        store_factory_.reset(new FIX::FileStoreFactory(settings_));
+        log_factory_.reset(new FIX::FileLogFactory(settings_));
+        initiator_.reset(new FIX::SocketInitiator(*this, *store_factory_, settings_, *log_factory_));
         initiator_->start();
         running_ = true;
         if (logger_) logger_->info("QuickFIX connector started", "QuickFixConnector::start");
@@ -93,19 +77,37 @@ void QuickFixConnector::onCreate(const FIX::SessionID& sessionID) {
 
 void QuickFixConnector::onLogon(const FIX::SessionID& sessionID) {
     if (logger_) logger_->info("QuickFIX session logged on: " + sessionID.toString(), "QuickFixConnector::onLogon");
+
+    // cTrader Market Data Session Logic
+    std::string targetSubID;
+    try {
+        if (settings_.has(sessionID)) {
+            targetSubID = settings_.get(sessionID).getString("TargetSubID");
+        }
+    } catch (...) {}
+
     // On logon, subscribe for MD for all configured symbols
     std::string symbols = config_->getString("marketdata", "symbols", "");
     if (!symbols.empty()) {
         std::istringstream ss(symbols);
         std::string symbol;
         while (std::getline(ss, symbol, ',')) {
-            trim(symbol); // we'll implement trim inline; but to keep code compiling, use quick workaround
+            trim(symbol);
             // Build MDRequest
             FIX44::MarketDataRequest mdReq;
             FIX::MDReqID reqId("MD-" + symbol);
             mdReq.set(reqId);
             mdReq.set(FIX::SubscriptionRequestType(FIX::SubscriptionRequestType_SNAPSHOT_AND_UPDATES));
             mdReq.set(FIX::MarketDepth(1));
+            mdReq.set(FIX::MDUpdateType(FIX::MDUpdateType_INCREMENTAL_REFRESH));
+
+            // Add MDEntryTypes (Bid and Ask)
+            FIX44::MarketDataRequest::NoMDEntryTypes marketDataEntryGroup;
+            marketDataEntryGroup.set(FIX::MDEntryType(FIX::MDEntryType_BID));
+            mdReq.addGroup(marketDataEntryGroup);
+            marketDataEntryGroup.set(FIX::MDEntryType(FIX::MDEntryType_OFFER));
+            mdReq.addGroup(marketDataEntryGroup);
+
             // No related symbols
             FIX44::MarketDataRequest::NoRelatedSym relSym;
             relSym.set(FIX::Symbol(symbol));
@@ -124,10 +126,45 @@ void QuickFixConnector::onLogout(const FIX::SessionID& sessionID) {
     if (logger_) logger_->info("QuickFIX session logged out: " + sessionID.toString(), "QuickFixConnector::onLogout");
 }
 
-void QuickFixConnector::toAdmin(FIX::Message&, const FIX::SessionID&) {}
+void QuickFixConnector::toAdmin(FIX::Message& message, const FIX::SessionID& sessionID) {
+    try {
+        FIX::MsgType msgType;
+        message.getHeader().getField(msgType);
+        if (msgType == FIX::MsgType_Logon) {
+            if (logger_) logger_->info("Enriching Logon message in toAdmin", "QuickFixConnector::toAdmin");
+            
+            // Manually inject session fields if missing
+            // This is a workaround for QuickFIX sometimes not picking them up from config for Logon
+            const FIX::Dictionary& dict = settings_.get(sessionID);
+            
+            if (dict.has("TargetSubID") && !message.getHeader().isSetField(FIX::FIELD::TargetSubID)) {
+                message.getHeader().setField(FIX::TargetSubID(dict.getString("TargetSubID")));
+            }
+            if (dict.has("SenderSubID") && !message.getHeader().isSetField(FIX::FIELD::SenderSubID)) {
+                message.getHeader().setField(FIX::SenderSubID(dict.getString("SenderSubID")));
+            }
+            if (dict.has("Username") && !message.isSetField(FIX::FIELD::Username)) {
+                message.setField(FIX::Username(dict.getString("Username")));
+            }
+            if (dict.has("Password") && !message.isSetField(FIX::FIELD::Password)) {
+                message.setField(FIX::Password(dict.getString("Password")));
+            }
+        }
+    } catch (const std::exception& e) {
+        if (logger_) logger_->error(std::string("Error in toAdmin: ") + e.what(), "QuickFixConnector::toAdmin");
+    }
+}
 void QuickFixConnector::toApp(FIX::Message&, const FIX::SessionID&) {}
 
-void QuickFixConnector::fromAdmin(const FIX::Message&, const FIX::SessionID&) {}
+void QuickFixConnector::fromAdmin(const FIX::Message& message, const FIX::SessionID&) {
+    try {
+        FIX::MsgSeqNum msgSeqNum;
+        if (message.getHeader().isSetField(msgSeqNum)) {
+            message.getHeader().getField(msgSeqNum);
+            last_msg_seq_.store(msgSeqNum.getValue());
+        }
+    } catch (...) {}
+}
 
 void QuickFixConnector::fromApp(const FIX::Message& message, const FIX::SessionID& sessionID) {
     // Check message sequence for gaps. If gap detected, request resend
@@ -301,7 +338,8 @@ void QuickFixConnector::onMessage(const FIX44::MarketDataIncrementalRefresh& mes
             FIX::Symbol symbol;
             if (message.isSetField(symbol)) {
                 message.getField(symbol);
-                trade.symbol = symbol.getValue();
+                std::strncpy(trade.symbol, symbol.getValue().c_str(), sizeof(trade.symbol) - 1);
+                trade.symbol[sizeof(trade.symbol) - 1] = '\0';
             }
             trade.timestamp = std::chrono::system_clock::now();
             publisher_->publishTrade(trade);
@@ -355,6 +393,52 @@ void QuickFixConnector::onMessage(const FIX44::MarketDataRequestReject& message,
         }
         if (logger_) logger_->warn("MarketDataRequestReject for " + mdReq.getValue() + " reason: " + reason.getValue(), "QuickFixConnector::onMessage");
     } catch (...) {}
+}
+
+void QuickFixConnector::onMessage(const FIX44::SecurityList& message, const FIX::SessionID& sessionID) {
+    if (logger_) logger_->info("Received SecurityList", "QuickFixConnector::onMessage");
+    
+    FIX::NoRelatedSym noRelatedSym;
+    if (message.isSetField(noRelatedSym)) {
+        message.get(noRelatedSym);
+        int count = noRelatedSym.getValue();
+        if (logger_) logger_->info("SecurityList contains " + std::to_string(count) + " symbols", "QuickFixConnector::onMessage");
+
+        FIX44::SecurityList::NoRelatedSym group;
+        for (int i = 1; i <= count; ++i) {
+            message.getGroup(i, group);
+            
+            FIX::Symbol symbol;
+            FIX::SecurityDesc desc;
+            std::string symVal = "";
+            std::string descVal = "";
+            std::string symNameVal = "";
+
+            if (group.isSetField(symbol)) {
+                group.get(symbol);
+                symVal = symbol.getValue();
+            }
+            if (group.isSetField(desc)) {
+                group.get(desc);
+                descVal = desc.getValue();
+            }
+            
+            // cTrader uses tag 1007 for SymbolName
+            if (group.isSetField(1007)) {
+                symNameVal = group.getField(1007);
+            }
+
+            // Log if it looks like Apple
+            if (descVal.find("Apple") != std::string::npos || descVal.find("AAPL") != std::string::npos || 
+                symVal == "AAPL" || symVal.find("Apple") != std::string::npos ||
+                symNameVal == "AAPL" || symNameVal.find("Apple") != std::string::npos) {
+                if (logger_) logger_->info("FOUND APPLE SYMBOL: ID=" + symVal + " Name=" + symNameVal + " Desc=" + descVal, "QuickFixConnector::onMessage");
+            }
+            
+            // Log all symbols found
+            if (logger_) logger_->info("Symbol ID: " + symVal + " Name: " + symNameVal + " Desc: " + descVal, "QuickFixConnector::onMessage");
+        }
+    }
 }
 
 // Expose stats through getters (small wrapper implementation)

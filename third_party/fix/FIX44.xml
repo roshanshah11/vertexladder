@@ -955,7 +955,7 @@
   </message>
   <message name='BusinessMessageReject' msgtype='j' msgcat='app'>
    <field name='RefSeqNum' required='N' />
-   <field name='RefMsgType' required='Y' />
+   <field name='RefMsgType' required='N' />
    <field name='BusinessRejectRefID' required='N' />
    <field name='BusinessRejectReason' required='Y' />
    <field name='Text' required='N' />
@@ -3023,8 +3023,8 @@
    <group name='NoMDEntries' required='Y'>
     <field name='MDEntryType' required='Y' />
     <field name='MDEntryPx' required='N' />
-    <field name='Currency' required='N' />
     <field name='MDEntrySize' required='N' />
+    <field name='Currency' required='N' />
     <field name='MDEntryDate' required='N' />
     <field name='MDEntryTime' required='N' />
     <field name='TickDirection' required='N' />
@@ -3069,8 +3069,8 @@
     <field name='FinancialStatus' required='N' />
     <field name='CorporateAction' required='N' />
     <field name='MDEntryPx' required='N' />
-    <field name='Currency' required='N' />
     <field name='MDEntrySize' required='N' />
+    <field name='Currency' required='N' />
     <field name='MDEntryDate' required='N' />
     <field name='MDEntryTime' required='N' />
     <field name='TickDirection' required='N' />
@@ -3432,6 +3432,8 @@
     <field name='Text' required='N' />
     <field name='EncodedTextLen' required='N' />
     <field name='EncodedText' required='N' />
+    <field name='SymbolName' required='N' />
+    <field name='SymbolDigits' required='N' />
    </group>
   </component>
   <component name='SecTypesGrp'>
@@ -6596,5 +6598,7 @@
   <field number='954' name='Nested3PartySubIDType' type='INT' />
   <field number='955' name='LegContractSettlMonth' type='MONTHYEAR' />
   <field number='956' name='LegInterestAccrualDate' type='LOCALMKTDATE' />
+  <field number='1007' name='SymbolName' type='STRING' />
+  <field number='1008' name='SymbolDigits' type='INT' />
  </fields>
 </fix>

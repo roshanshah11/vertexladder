@@ -7,6 +7,7 @@
 #include <boost/lockfree/spsc_queue.hpp>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <optional>
 #include <memory>
 #include <mutex>
@@ -116,7 +117,7 @@ private:
     std::atomic<bool> running_;
 
     void processLoop();
-    void processAddOrder(std::unique_ptr<Order> order);
+    void processAddOrder(Order* order);
     void processCancelOrder(OrderId id);
     void processModifyOrder(OrderId id, Price new_price, Quantity new_quantity);
 
@@ -131,6 +132,19 @@ private:
     std::atomic<size_t> producer_rr_index_{0};
     // Per-OrderBook trade counter for benchmarking without a publisher
     std::atomic<uint64_t> trade_count_{0};
+    // Simple single-threaded LIFO free-list for Orders (consumer-only)
+    static constexpr size_t DefaultOrderPoolSize = 20000;
+    std::vector<Order*> order_free_list_;
+    // Track in-use pointers to detect double-release / misuse during development
+    std::unordered_set<Order*> order_in_use_set_;
+    // Deferred retirement list to avoid immediate reuse within same processing batch
+    std::vector<Order*> order_retire_list_;
+    // Debug counters for diagnostics
+    std::atomic<uint64_t> debug_acquire_count_{0};
+    std::atomic<uint64_t> debug_release_count_{0};
+        // Acquire and release helpers (consumer single-threaded)
+        Order* acquireOrder(const OrderRequest& req);
+        void releaseOrder(Order* order);
     // Optimized storage: use heap-allocated PriceLevel for pointer stability
     std::vector<std::unique_ptr<PriceLevel>> bids_;
     std::vector<std::unique_ptr<PriceLevel>> asks_;

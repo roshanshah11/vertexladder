@@ -85,10 +85,10 @@ public:
     virtual std::string getAccountForOrder(OrderId order_id) const = 0;
 
     /**
-     * @brief Bypass risk checks (for testing / benchmarking only)
+     * @brief Bypass risk checks (useful for performance harnesses)
      */
-    virtual void setBypass(bool bypass) { (void)bypass; }
-    virtual bool isBypassed() const { return false; }
+    virtual void setBypass(bool bypass) = 0;
+    virtual bool isBypassed() const = 0;
 };
 
 /**

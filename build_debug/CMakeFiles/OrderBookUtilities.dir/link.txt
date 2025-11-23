@@ -1,2 +1,0 @@
-/usr/bin/ar qc libOrderBookUtilities.a CMakeFiles/OrderBookUtilities.dir/src/Utilities/Logger.cpp.o CMakeFiles/OrderBookUtilities.dir/src/Utilities/Config.cpp.o CMakeFiles/OrderBookUtilities.dir/src/Utilities/PerformanceTimer.cpp.o CMakeFiles/OrderBookUtilities.dir/src/Utilities/PerformanceTest.cpp.o
-/usr/bin/ranlib libOrderBookUtilities.a

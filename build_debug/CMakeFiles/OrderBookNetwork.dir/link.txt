@@ -1,2 +1,0 @@
-/usr/bin/ar qc libOrderBookNetwork.a CMakeFiles/OrderBookNetwork.dir/src/Network/FixParser.cpp.o CMakeFiles/OrderBookNetwork.dir/src/Network/FixSession.cpp.o CMakeFiles/OrderBookNetwork.dir/src/Network/FixMessageHandler.cpp.o CMakeFiles/OrderBookNetwork.dir/src/Network/FixServer.cpp.o
-/usr/bin/ranlib libOrderBookNetwork.a

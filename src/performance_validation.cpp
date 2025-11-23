@@ -17,7 +17,7 @@ int main(int argc, char* argv[]) {
         bool run_latency_benchmark = false;
         bool run_throughput_stress = false;
         bool run_full_test = true;
-        size_t num_orders = 100000;
+        size_t num_orders = 1000000;
         size_t num_threads = 1;
         
         for (int i = 1; i < argc; ++i) {

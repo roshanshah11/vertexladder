@@ -1,2 +1,0 @@
-/usr/bin/ar qc libOrderBookMarketData.a CMakeFiles/OrderBookMarketData.dir/src/MarketData/MarketDataFeed.cpp.o CMakeFiles/OrderBookMarketData.dir/src/MarketData/Adapters/QuickFixConnector.cpp.o
-/usr/bin/ranlib libOrderBookMarketData.a

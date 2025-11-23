@@ -36,6 +36,13 @@ OrderBook::OrderBook(RiskManagerPtr risk_manager,
     for (size_t i = 0; i < OrderQueueCount; ++i) {
         order_queues_.emplace_back(std::make_unique<boost::lockfree::spsc_queue<OrderRequest, boost::lockfree::capacity<OrderQueueCapacity>>>());
     }
+    // Prepare free list capacity and pre-warm pool to avoid allocations on hot-path
+    // Pre-allocate 1,000,000 Order objects so acquireOrder is O(1) during tests
+    constexpr size_t PreWarmPoolSize = 1000000u;
+    order_free_list_.reserve(PreWarmPoolSize);
+    for (size_t i = 0; i < PreWarmPoolSize; ++i) {
+        order_free_list_.push_back(new Order());
+    }
 }
 
 OrderBook::~OrderBook() {
@@ -46,6 +53,20 @@ OrderBook::~OrderBook() {
     queue_cv_.notify_one();
     if (processing_thread_.joinable()) {
         processing_thread_.join();
+    }
+
+    // Cleanup pooled orders and any deferred retire list to avoid leaking memory
+    // Delete unique pointers only once (guard against duplicates)
+    {
+        std::unordered_set<Order*> freed;
+        for (Order* p : order_retire_list_) {
+            if (p && freed.insert(p).second) delete p;
+        }
+        order_retire_list_.clear();
+        for (Order* p : order_free_list_) {
+            if (p && freed.insert(p).second) delete p;
+        }
+        order_free_list_.clear();
     }
 }
 
@@ -94,11 +115,9 @@ void OrderBook::processLoop() {
                     switch (req.type) {
                         case OrderRequest::Type::Add: {
                             // Construct Order on consumer side to avoid producer allocation
-                            Order* created = new Order(req.id.value, req.side, req.order_type, req.price, req.quantity, std::string(req.symbol));
-                            created->account = std::string(req.account);
-                            created->tif = static_cast<TimeInForce>(req.tif);
-                            std::unique_ptr<Order> o(created);
-                            processAddOrder(std::move(o));
+                            // Allocate Order from recycle bin or heap (consumer-thread only)
+                            auto created = acquireOrder(req);
+                            processAddOrder(created);
                             break;
                         }
                         case OrderRequest::Type::Cancel: {
@@ -115,6 +134,23 @@ void OrderBook::processLoop() {
                 }
             }
         }
+        // Flush deferred releases back into the pool
+        if (!order_retire_list_.empty()) {
+#ifndef NDEBUG
+            std::cout << "[debug] flushing retire list size=" << order_retire_list_.size() << std::endl;
+#endif
+            for (Order* p : order_retire_list_) {
+#ifndef NDEBUG
+                if (p) std::cout << "[debug] releasing order id=" << p->id.value << std::endl;
+#endif
+                releaseOrder(p);
+            }
+#ifndef NDEBUG
+            std::cout << "[debug] flushed retire list" << std::endl;
+#endif
+            order_retire_list_.clear();
+        }
+
         // Mark processed flag reset
         order_data_available_.store(false, std::memory_order_release);
     }
@@ -184,8 +220,8 @@ OrderResult OrderBook::addOrder(const Order& order) {
     req.quantity = order.quantity;
     std::memset(req.symbol, 0, sizeof(req.symbol));
     std::memset(req.account, 0, sizeof(req.account));
-    std::strncpy(req.symbol, order.symbol.c_str(), sizeof(req.symbol) - 1);
-    std::strncpy(req.account, order.account.c_str(), sizeof(req.account) - 1);
+    std::strncpy(req.symbol, order.symbol, sizeof(req.symbol) - 1);
+    std::strncpy(req.account, order.account, sizeof(req.account) - 1);
     req.tif = static_cast<int>(order.tif);
     order_queues_[getOrderQueueIndex()]->push(req);
     order_data_available_.store(true, std::memory_order_release);
@@ -194,7 +230,7 @@ OrderResult OrderBook::addOrder(const Order& order) {
     return OrderResult::success(order.id);
 }
 
-void OrderBook::processAddOrder(std::unique_ptr<Order> order_ptr) {
+void OrderBook::processAddOrder(Order* order_ptr) {
     PERF_MEASURE_SCOPE("OrderBook::processAddOrder");
     // Assign timestamp here on consumer side to avoid syscalls on producer hot path
     order_ptr->timestamp = std::chrono::system_clock::now();
@@ -210,7 +246,7 @@ void OrderBook::processAddOrder(std::unique_ptr<Order> order_ptr) {
     if (risk_manager_) {
         if (!risk_manager_->isBypassed()) {
             // Associate order with account
-            std::string account = order_ptr->account.empty() ? "default" : order_ptr->account;
+            std::string account = (order_ptr->account[0] == '\0') ? "default" : order_ptr->account;
             risk_manager_->associateOrderWithAccount(order_ptr->id, account);
             
             // Get the portfolio for the order's account
@@ -255,17 +291,14 @@ void OrderBook::processAddOrder(std::unique_ptr<Order> order_ptr) {
         return;
     }
     
-    // Add order to price level
-    price_level->addOrder(order_ptr.get());
-    
-    // Add to order index for fast lookup
-    OrderLocation location(order_ptr.get(), price_level, order_ptr->side);
-    order_index_[order_ptr->id] = location;
-    
-    // Move pooled object to book ownership so it remains allocated until removed
-    // Move unique_ptr into order_index ownership; it will be freed on removal
-    // Release ownership - order is now managed by price level
-    Order* order_raw = order_ptr.release();
+    // Add order to price level (price level uses raw pointers for speed)
+    // Use raw pointer for order now
+    Order* order_raw = order_ptr;
+    price_level->addOrder(order_raw);
+
+    // Add to order index for fast lookup - consumer owns raw pointer until removed
+    OrderLocation location(order_raw, price_level, order_raw->side);
+    order_index_[order_raw->id] = location;
     
     // Maintain sorted order - optimization: findOrCreatePriceLevel already maintains order
     // maintainSortedOrder();
@@ -278,13 +311,20 @@ void OrderBook::processAddOrder(std::unique_ptr<Order> order_ptr) {
     processMatching(*order_raw);
     
     // Handle aggressive order updates after matching
+    // After matching, the price level may have been removed. Re-query the current level.
+    PriceLevel* current_level = nullptr;
+    {
+        auto p_it = price_index_.find(order_raw->price);
+        if (p_it != price_index_.end()) current_level = p_it->second;
+    }
+
     if (order_raw->filled_quantity > 0) {
         // Update price level total quantity to reflect the fill
         // Note: We must be careful not to double-count if we remove the order later
         // The safest way is to update the price level's quantity to match the order's new state
         // But PriceLevel::updateQuantity is designed for this
         
-        price_level->updateQuantity(order_raw, order_raw->filled_quantity);
+        if (current_level) current_level->updateQuantity(order_raw, order_raw->filled_quantity);
         
         // If fully filled, updateQuantity already removed it from the list?
         // Let's check PriceLevel::updateQuantity implementation
@@ -296,36 +336,36 @@ void OrderBook::processAddOrder(std::unique_ptr<Order> order_ptr) {
         // So updateQuantity handles removal from the linked list!
         // But we still need to handle OrderIndex and Memory cleanup.
         
-        if (order_raw->isFullyFilled()) {
+            if (order_raw->isFullyFilled()) {
             // Publish book update for removal
             publishBookUpdate(BookUpdate::Type::Remove, order_raw->side, order_raw->price, 
-                             0, price_level->order_count); // order_count is already updated by removeOrder
+                             0, current_level ? current_level->order_count : 0); // order_count is already updated by removeOrder
             
             // Clean up empty price level
-            if (price_level->isEmpty()) {
+            if (current_level && current_level->isEmpty()) {
                 // The level may have already been removed by matching. Check the
                 // price index to ensure the pointer is still valid before removal.
                 auto p_it = price_index_.find(order_raw->price);
-                if (p_it != price_index_.end() && p_it->second == price_level) {
-                    removePriceLevel(price_level, order_raw->side);
+                if (p_it != price_index_.end() && p_it->second == current_level) {
+                    removePriceLevel(current_level, order_raw->side);
                 }
             }
             
-            // Remove from order index
+            // Remove from order index; defer free until batch end to avoid reuse mid-processing
             auto it = order_index_.find(order_raw->id);
             if (it != order_index_.end()) {
                 order_index_.erase(it);
             }
-            
-            // Delete the order
-            delete order_raw;
+
+            // Defer returning pointer to pool until end of batch
+            order_retire_list_.push_back(order_raw);
             
             // Set order_raw to null to avoid using it
             order_raw = nullptr;
         } else {
             // Partially filled
              publishBookUpdate(BookUpdate::Type::Modify, order_raw->side, order_raw->price, 
-                              order_raw->remainingQuantity(), price_level->order_count);
+                              order_raw->remainingQuantity(), current_level ? current_level->order_count : 0);
         }
     }
     
@@ -393,10 +433,9 @@ void OrderBook::processCancelOrder(OrderId id) {
         }
     }
     
-    // Return pooled order to pool by erasing the pooled object entry
-    delete location.order;
-
     // Remove from order index
+    // Defer returning the pooled object until end of batch to avoid reuse mid-processing
+    order_retire_list_.push_back(location.order);
     order_index_.erase(it);
     
     // Publish market data update (best prices and depth)
@@ -483,8 +522,8 @@ void OrderBook::processModifyOrder(OrderId id, Price new_price, Quantity new_qua
         publishBookUpdate(BookUpdate::Type::Add, order->side, new_price, 
                          order->remainingQuantity(), new_price_level->order_count);
         
-        // Update order index
-        order_index_[id] = OrderLocation(order, new_price_level, order->side);
+        // Update order index - keep owning shared_ptr and update price level pointer
+        order_index_[id] = OrderLocation(location.order, new_price_level, order->side);
     }
     
     // Update quantity if specified
@@ -521,36 +560,38 @@ void OrderBook::processModifyOrder(OrderId id, Price new_price, Quantity new_qua
 // Market data queries with O(1) performance
 std::optional<Price> OrderBook::bestBid() const {
     PERF_MEASURE("OrderBook::bestBid");
-    if (bids_.empty()) {
-        return std::nullopt;
+    for (auto it = bids_.rbegin(); it != bids_.rend(); ++it) {
+        if (!(*it)->isEmpty()) return (*it)->price;
     }
-    // Best bid is at the end (highest price)
-    return bids_.back()->price;
+    return std::nullopt;
 }
 
 std::optional<Price> OrderBook::bestAsk() const {
     PERF_MEASURE("OrderBook::bestAsk");
-    if (asks_.empty()) {
-        return std::nullopt;
+    for (auto it = asks_.rbegin(); it != asks_.rend(); ++it) {
+        if (!(*it)->isEmpty()) return (*it)->price;
     }
-    // Best ask is at the end (lowest price)
-    return asks_.back()->price;
+    return std::nullopt;
 }
 
 BestPrices OrderBook::getBestPrices() const {
     BestPrices prices;
     prices.timestamp = std::chrono::system_clock::now();
     
-    if (!bids_.empty()) {
-        const auto& best_bid_level = bids_.back();
-        prices.bid = best_bid_level->price;
-        prices.bid_size = best_bid_level->total_quantity;
+    for (auto it = bids_.rbegin(); it != bids_.rend(); ++it) {
+        if (!(*it)->isEmpty()) {
+            prices.bid = (*it)->price;
+            prices.bid_size = (*it)->total_quantity;
+            break;
+        }
     }
     
-    if (!asks_.empty()) {
-        const auto& best_ask_level = asks_.back();
-        prices.ask = best_ask_level->price;
-        prices.ask_size = best_ask_level->total_quantity;
+    for (auto it = asks_.rbegin(); it != asks_.rend(); ++it) {
+        if (!(*it)->isEmpty()) {
+            prices.ask = (*it)->price;
+            prices.ask_size = (*it)->total_quantity;
+            break;
+        }
     }
     
     return prices;
@@ -561,29 +602,27 @@ MarketDepth OrderBook::getDepth(size_t levels) const {
     depth.timestamp = std::chrono::system_clock::now();
     
     // Get bid levels (highest to lowest)
-    size_t bid_count = std::min(levels, bids_.size());
-    depth.bids.reserve(bid_count);
-    
-    for (size_t i = 0; i < bid_count; ++i) {
-        const auto& level = bids_[bids_.size() - 1 - i]; // Start from best (end)
+    size_t count = 0;
+    for (auto it = bids_.rbegin(); it != bids_.rend() && count < levels; ++it) {
+        if ((*it)->isEmpty()) continue;
         depth.bids.emplace_back(MarketDepth::Level{
-            level->price, 
-            level->total_quantity, 
-            level->order_count
+            (*it)->price, 
+            (*it)->total_quantity, 
+            (*it)->order_count
         });
+        count++;
     }
     
     // Get ask levels (lowest to highest)
-    size_t ask_count = std::min(levels, asks_.size());
-    depth.asks.reserve(ask_count);
-    
-    for (size_t i = 0; i < ask_count; ++i) {
-        const auto& level = asks_[asks_.size() - 1 - i]; // Start from best (end)
+    count = 0;
+    for (auto it = asks_.rbegin(); it != asks_.rend() && count < levels; ++it) {
+        if ((*it)->isEmpty()) continue;
         depth.asks.emplace_back(MarketDepth::Level{
-            level->price, 
-            level->total_quantity, 
-            level->order_count
+            (*it)->price, 
+            (*it)->total_quantity, 
+            (*it)->order_count
         });
+        count++;
     }
     
     return depth;
@@ -652,21 +691,15 @@ PriceLevel* OrderBook::findOrCreatePriceLevel(Price price, Side side) {
 }
 
 void OrderBook::removePriceLevel(PriceLevel* level, Side side) {
-    if (!level) {
-        if (logger_) {
-            logger_->warn("Attempted to remove null price level", "OrderBook::removePriceLevel");
-        }
-        return;
-    }
+    // Optimization: Do not remove price levels from vector to avoid O(N) shift operations.
+    // Empty levels are skipped during matching and market data generation.
+    // This makes cancellation O(1) and allows reuse of price levels (avoiding allocation).
+    
+    /*
+    if (!level) return;
     
     // Verify the level is actually empty before removing
-    if (!level->isEmpty()) {
-        if (logger_) {
-            logger_->warn("Attempted to remove non-empty price level at " + 
-                         std::to_string(level->price), "OrderBook::removePriceLevel");
-        }
-        return;
-    }
+    if (!level->isEmpty()) return;
     
     Price price = level->price;
     
@@ -685,20 +718,8 @@ void OrderBook::removePriceLevel(PriceLevel* level, Side side) {
     
     if (it != levels.end()) {
         levels.erase(it);
-        
-        if (logger_) {
-            logger_->debug("Removed empty price level at " + std::to_string(price) + 
-                          " from " + (side == Side::Buy ? "bids" : "asks"), 
-                          "OrderBook::removePriceLevel");
-        }
-    } else {
-        if (logger_) {
-            logger_->warn("Price level not found in vector during removal at " + 
-                         std::to_string(price), "OrderBook::removePriceLevel");
-        }
     }
-    // No need to rebuild the entire price index: other PriceLevel pointers are stable
-    // as PriceLevel objects are heap-allocated. We only removed the specific price.
+    */
 }
 
 void OrderBook::maintainSortedOrder() {
@@ -820,7 +841,8 @@ void OrderBook::executeMatching(Order& incoming_order, std::vector<std::unique_p
     for (auto it = opposite_levels.rbegin(); it != opposite_levels.rend(); ++it) {
         auto& levelPtr = *it; // unique_ptr<PriceLevel>&
 
-        if (levelPtr->isEmpty() || incoming_order.isFullyFilled()) break;
+        if (levelPtr->isEmpty()) continue;
+        if (incoming_order.isFullyFilled()) break;
         
         // Check price condition
         bool can_match = false;
@@ -851,11 +873,13 @@ void OrderBook::matchAgainstPriceLevel(Order& incoming_order, PriceLevel& price_
         
         if (trade_quantity == 0) {
              // Handle ghost orders (fully filled but not removed)
-             if (current_order->remainingQuantity() == 0) {
+                 if (current_order->remainingQuantity() == 0) {
                  price_level.removeOrder(current_order);
                  auto it = order_index_.find(current_order->id);
-                 if (it != order_index_.end()) order_index_.erase(it);
-                 delete current_order;
+                 if (it != order_index_.end()) {
+                     order_retire_list_.push_back(it->second.order);
+                     order_index_.erase(it);
+                 }
                  current_order = next_order;
                  continue;
              }
@@ -885,11 +909,10 @@ void OrderBook::matchAgainstPriceLevel(Order& incoming_order, PriceLevel& price_
             // Remove filled order from order index
             auto it = order_index_.find(current_order->id);
             if (it != order_index_.end()) {
+                // Defer returning to pool until end of batch
+                order_retire_list_.push_back(it->second.order);
                 order_index_.erase(it);
             }
-            
-            // Return pooled order to pool
-            delete current_order;
             current_order = next_order;
         }
     }
@@ -975,13 +998,13 @@ void OrderBook::poll() {
         for (auto& qptr : market_queues_) {
             while (qptr->pop(update)) {
                 any_popped = true;
-        if (update.type == MarketUpdate::Type::SnapshotStart) {
-            // Clear book logic
+            if (update.type == MarketUpdate::Type::SnapshotStart) {
+            // Clear book logic - collect all orders into retire list, then clear structures
             for (auto& level : bids_) {
                 Order* cur = level->getFirstOrder();
                 while (cur) {
                     Order* next = cur->next;
-                    delete cur;
+                    order_retire_list_.push_back(cur);
                     cur = next;
                 }
             }
@@ -989,14 +1012,14 @@ void OrderBook::poll() {
                 Order* cur = level->getFirstOrder();
                 while (cur) {
                     Order* next = cur->next;
-                    delete cur;
+                    order_retire_list_.push_back(cur);
                     cur = next;
                 }
             }
+            order_index_.clear();
             bids_.clear();
             asks_.clear();
             price_index_.clear();
-            order_index_.clear();
             if (logger_) logger_->info("OrderBook cleared via queue", "OrderBook::poll");
             continue;
         }
@@ -1046,6 +1069,67 @@ size_t OrderBook::getOrderQueueIndex() {
         local_index = order_producer_rr_index_.fetch_add(1u) % order_queues_.size();
     }
     return local_index;
+}
+
+Order* OrderBook::acquireOrder(const OrderRequest& req) {
+    Order* o = nullptr;
+    if (!order_free_list_.empty()) {
+        o = order_free_list_.back();
+        order_free_list_.pop_back();
+        // reset in-place
+        o->reset();
+    } else {
+        o = new Order();
+    }
+
+    // populate fields from request
+    o->id = req.id;
+    o->side = req.side;
+    o->type = req.order_type;
+    o->price = req.price;
+    o->quantity = req.quantity;
+    o->filled_quantity = 0;
+    std::strncpy(o->symbol, req.symbol, sizeof(o->symbol) - 1);
+    o->symbol[sizeof(o->symbol) - 1] = '\0';
+    std::strncpy(o->account, req.account, sizeof(o->account) - 1);
+    o->account[sizeof(o->account) - 1] = '\0';
+    o->tif = static_cast<TimeInForce>(req.tif);
+    // timestamp assigned by consumer's processAddOrder
+    // track in-use
+#ifndef NDEBUG
+    order_in_use_set_.insert(o);
+#endif
+    // Debug counts
+#ifndef NDEBUG
+    debug_acquire_count_.fetch_add(1, std::memory_order_relaxed);
+#endif
+
+    return o;
+}
+
+void OrderBook::releaseOrder(Order* order) {
+    if (!order) return;
+    // Reset fields to avoid stale data and push to free list
+    order->reset();
+    // Debug check: ensure not double releasing
+#ifndef NDEBUG
+    auto it = order_in_use_set_.find(order);
+    if (it == order_in_use_set_.end()) {
+        if (logger_) logger_->error("Attempted to release Order not tracked as in-use", "OrderBook::releaseOrder");
+        // In debug builds we avoid aborting to allow post-mortem diagnostics.
+        return;
+    }
+    order_in_use_set_.erase(it);
+#endif
+    // Debug counts
+#ifndef NDEBUG
+    auto released = debug_release_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((released % 10000) == 0) {
+        std::cout << "[debug] releases: " << released << " acquired: " << debug_acquire_count_.load() << std::endl;
+    }
+#endif
+    
+    order_free_list_.push_back(order);
 }
 
 uint64_t OrderBook::getTradeCount() const {

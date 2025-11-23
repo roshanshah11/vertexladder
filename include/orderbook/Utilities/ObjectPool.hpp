@@ -1,6 +1,7 @@
 #pragma once
 #include <vector>
 #include <memory>
+#include <cassert>
 #include <mutex>
 #include <atomic>
 #include <type_traits>
@@ -116,6 +117,44 @@ public:
         
         return PooledObject(raw_ptr, this);
     }
+
+    /**
+     * @brief Allocate an object from the pool and return raw pointer.
+     * Caller is responsible for returning it using release().
+     */
+    T* allocate() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (pool_.empty()) {
+            auto obj = std::make_unique<T>();
+            T* raw_ptr = obj.release();
+            ++total_created_;
+            if constexpr (has_reset<T>::value) raw_ptr->reset();
+            return raw_ptr;
+        }
+        auto obj = std::move(pool_.back());
+        pool_.pop_back();
+        available_count_.fetch_sub(1);
+        T* raw_ptr = obj.release();
+        if constexpr (has_reset<T>::value) raw_ptr->reset();
+        return raw_ptr;
+    }
+
+    /**
+     * @brief Release a previously allocated object back to the pool.
+     * @param obj Pointer returned from allocate()
+     */
+    void release(T* obj) {
+        // In debug builds, detect double-release which can indicate use-after-free
+#ifndef NDEBUG
+        for (const auto& p : pool_) {
+            if (p.get() == obj) {
+                // Double release detected - assert to help debugging
+                assert(false && "Double release to ObjectPool detected");
+            }
+        }
+#endif
+        returnObject(obj);
+    }
     
     /**
      * @brief Get pool statistics
@@ -142,19 +181,12 @@ private:
      */
     void returnObject(T* obj) {
         if (!obj) return;
-        
+
         std::lock_guard<std::mutex> lock(mutex_);
-        
-        // Limit pool size to prevent unbounded growth
-        constexpr size_t MAX_POOL_SIZE = 10000;
-        if (pool_.size() < MAX_POOL_SIZE) {
-            pool_.emplace_back(obj);
-            available_count_.fetch_add(1);
-        } else {
-            // Pool is full, delete the object
-            delete obj;
-        }
+        pool_.emplace_back(obj);
+        available_count_.fetch_add(1);
     }
+
     
     mutable std::mutex mutex_;
     std::vector<std::unique_ptr<T>> pool_;

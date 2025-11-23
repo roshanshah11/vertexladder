@@ -28,19 +28,27 @@ struct alignas(64) Order {  // 64-byte alignment for cache line optimization and
     
     // Timestamps and metadata (less frequently accessed)
     Timestamp timestamp;
-    std::string symbol;
-    std::string account;
+    char symbol[32];
+    char account[32];
     
     // Constructors
-    Order(uint64_t id, Side side, OrderType type, Price price, Quantity quantity, std::string symbol)
+    Order(uint64_t id, Side side, OrderType type, Price price, Quantity quantity, const char* sym)
         : id(OrderId(id)), price(price), quantity(quantity), side(side), type(type),
-          symbol(std::move(symbol)), timestamp(std::chrono::system_clock::now()) {}
+          timestamp(std::chrono::system_clock::now()) {
+              std::strncpy(symbol, sym, sizeof(symbol) - 1);
+              symbol[sizeof(symbol) - 1] = '\0';
+              account[0] = '\0';
+          }
     
     Order(uint64_t id, Side side, OrderType type, TimeInForce tif, Price price, Quantity quantity, 
-          std::string symbol, std::string account = "")
+          const char* sym, const char* acc = "")
         : id(OrderId(id)), price(price), quantity(quantity), side(side), type(type), tif(tif),
-          symbol(std::move(symbol)), account(std::move(account)), 
-          timestamp(std::chrono::system_clock::now()) {}
+          timestamp(std::chrono::system_clock::now()) {
+              std::strncpy(symbol, sym, sizeof(symbol) - 1);
+              symbol[sizeof(symbol) - 1] = '\0';
+              std::strncpy(account, acc, sizeof(account) - 1);
+              account[sizeof(account) - 1] = '\0';
+          }
     
     // Default constructor for object pooling
     Order() = default;
@@ -127,8 +135,8 @@ struct alignas(64) Order {  // 64-byte alignment for cache line optimization and
         status = OrderStatus::New;
         next = nullptr;
         prev = nullptr;
-        symbol.clear();
-        account.clear();
+        symbol[0] = '\0';
+        account[0] = '\0';
         timestamp = std::chrono::system_clock::now();
     }
 };
@@ -144,12 +152,15 @@ struct alignas(32) Trade {  // 32-byte alignment for SIMD operations
     Price price;
     Quantity quantity;
     Timestamp timestamp;
-    std::string symbol;
+    char symbol[32];
     
-    Trade(uint64_t trade_id, OrderId buy_id, OrderId sell_id, Price p, Quantity q, std::string sym)
+    Trade(uint64_t trade_id, OrderId buy_id, OrderId sell_id, Price p, Quantity q, const char* sym)
         : id(TradeId(trade_id)), buy_order_id(buy_id), sell_order_id(sell_id), 
-          price(p), quantity(q), symbol(std::move(sym)), 
-          timestamp(std::chrono::system_clock::now()) {}
+          price(p), quantity(q), 
+          timestamp(std::chrono::system_clock::now()) {
+              std::strncpy(symbol, sym, sizeof(symbol) - 1);
+              symbol[sizeof(symbol) - 1] = '\0';
+          }
 
     // Default constructor for object pool
     Trade() = default;
@@ -161,7 +172,7 @@ struct alignas(32) Trade {  // 32-byte alignment for SIMD operations
         sell_order_id = OrderId(0);
         price = 0.0;
         quantity = 0;
-        symbol.clear();
+        symbol[0] = '\0';
         timestamp = std::chrono::system_clock::now();
     }
 };
@@ -318,9 +329,7 @@ struct OrderLocation {
      * @brief Check if location is valid
      * @return true if order and price_level are not null
      */
-    bool isValid() const {
-        return order != nullptr && price_level != nullptr;
-    }
+    bool isValid() const { return order != nullptr && price_level != nullptr; }
 };
 
 }

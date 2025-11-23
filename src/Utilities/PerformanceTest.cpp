@@ -16,7 +16,7 @@ namespace orderbook {
 class PerformanceTest {
 public:
     struct TestConfig {
-        size_t num_orders = 100000;
+        size_t num_orders = 1000000;
         size_t num_threads = 1;
         double buy_sell_ratio = 0.5;
         Price min_price = 100.0;
@@ -149,16 +149,25 @@ void PerformanceTest::printResults(const TestResults& results) {
               << std::setw(12) << "Avg (μs)"
               << std::setw(12) << "P95 (μs)"
               << std::setw(12) << "P99 (μs)"
-              << std::setw(15) << "Throughput/s" << "\n";
+              << std::setw(15) << "Throughput/s"
+              << std::setw(15) << "Capacity/s" << "\n";
     std::cout << std::string(80, '-') << "\n";
 
     for (const auto& [operation_name, stats] : results.operation_stats) {
+        double capacity = 0.0;
+        if (stats.avg_latency.count() > 0) {
+            capacity = 1000000000.0 / stats.avg_latency.count();
+        } else if (stats.sample_count > 0) {
+            capacity = 999999999.0; // effectively infinite
+        }
+
         std::cout << std::left << std::setw(25) << operation_name
                   << std::setw(10) << stats.sample_count
                   << std::setw(12) << std::fixed << std::setprecision(2) << (stats.avg_latency.count() / 1000.0)
                   << std::setw(12) << (stats.p95_latency.count() / 1000.0)
                   << std::setw(12) << (stats.p99_latency.count() / 1000.0)
                   << std::setw(15) << std::fixed << std::setprecision(2) << stats.throughput_ops_per_sec
+                  << std::setw(15) << std::fixed << std::setprecision(2) << capacity
                   << "\n";
     }
 
@@ -233,7 +242,7 @@ PerformanceTest::TestResults PerformanceTest::runSingleThreadedTest(OrderBook& o
         Price price = std::round(price_dist(rng) * 100.0) / 100.0;
         Quantity qty = static_cast<Quantity>(qty_dist(rng));
         Side side = (side_dist(rng) < config.buy_sell_ratio) ? Side::Buy : Side::Sell;
-            Order order(next_id++, side, OrderType::Limit, price, qty, config.symbol);
+            Order order(next_id++, side, OrderType::Limit, price, qty, config.symbol.c_str());
             PERF_MEASURE_SCOPE("StressTest::AddOrder");
             auto res = order_book.addOrder(order);
         if (res.isSuccess()) results.orders_processed++;
@@ -264,7 +273,7 @@ PerformanceTest::TestResults PerformanceTest::runMultiThreadedTest(OrderBook& or
             Quantity qty = static_cast<Quantity>(qty_dist(rng));
             Side side = (side_dist(rng) < config.buy_sell_ratio) ? Side::Buy : Side::Sell;
             uint64_t id = next_id.fetch_add(1);
-            Order order(id, side, OrderType::Limit, price, qty, config.symbol);
+            Order order(id, side, OrderType::Limit, price, qty, config.symbol.c_str());
             PERF_MEASURE_SCOPE("StressTest::AddOrder");
             auto res = order_book.addOrder(order);
             if (res.isSuccess()) processed.fetch_add(1);

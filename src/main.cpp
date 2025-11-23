@@ -428,6 +428,9 @@ int main(int argc, char* argv[]) {
             std::cout << "Total Orders: " << book.getOrderCount() << "\n";
             std::cout << "Bid Levels: " << book.getBidLevelCount() << "\n";
             std::cout << "Ask Levels: " << book.getAskLevelCount() << "\n";
+
+            std::cout << "\nPress Enter to exit...\n";
+            std::cin.get();
         }
         
         logger->info("OrderBook application completed successfully", "main");

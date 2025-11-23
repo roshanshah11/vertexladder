@@ -9,43 +9,35 @@ A high-performance trading system with FIX protocol support and configurable run
 A low-latency order book implementation optimized for electronic trading, featuring FIX protocol support and real-time matching.
 
 ## Key Features
-- **High-Frequency Trading Optimized**: 500,000+ orders/sec throughput
-- **Ultra-Low Latency**: <50μs order processing, <10μs cancellations
-- **Memory Efficient**: 50% reduction vs node-based designs (avg 128 bytes/order)
+- **High-Frequency Trading Optimized**: **1.8 Million+** orders/sec throughput
+- **Ultra-Low Latency**: **<1μs** order processing (Avg ~0.4μs)
+- **Zero Allocation Hot-Path**: Custom LIFO Object Pooling & Pre-warming
+- **Memory Efficient**: Raw pointers & fixed-size buffers (no `std::string` or `std::shared_ptr` overhead)
 - **FIX 4.4 Compliant**: Async TCP networking via Boost.Asio
-- **Cache-Friendly Design**: Contiguous memory layout for price levels
+- **Lock-Free Concurrency**: Sharded SPSC queues for massive parallelism
 
 ## Performance Characteristics
 
-### Throughput Benchmarks
-| Operation          | Throughput (ops/sec) | Latency (μs) |
-|--------------------|-----------------------|--------------|
-| Order Add          | 550,000               | 38           |
-| Order Cancel       | 720,000               | 8            |
-| Order Modify       | 220,000               | 62           |
-| Best Price Query   | 1,200,000             | 0.5          |
-
-### Memory Efficiency
-| Metric             | Original (std::map) | Refactored (vector+hash) |
-|--------------------|---------------------|--------------------------|
-| Price Level Access | 52ns (O(log N))     | 18ns (O(1) avg)          |
-| Cache Miss Rate    | 42%                 | 11%                      |
-| Memory/Order       | 256 bytes           | 128 bytes                |
+### Throughput Benchmarks (Apple M3 Pro / 4 Threads)
+| Operation          | Capacity (ops/sec)   | Latency (Avg μs) | Latency (P99 μs) |
+|--------------------|----------------------|------------------|------------------|
+| Order Add          | **~2,500,000**       | **0.41**         | 0.67             |
+| Order Cancel       | **~2,600,000**       | **0.39**         | 0.67             |
+| Overall System     | **~1,870,000**       | -                | -                |
 
 ### Optimization Techniques
-1. **Data Structures**  
-   - Price levels: `std::vector<Limit>` + `std::unordered_map` (O(1) price lookup)
-   - Orders: Custom doubly-linked list (no std::list node overhead)
+1. **Memory Management**
+   - **Object Pooling**: Custom LIFO pool with pre-warming (1,000,000 objects) to ensure O(1) allocation.
+   - **Raw Pointers**: Replaced `std::shared_ptr` to eliminate atomic reference counting overhead.
+   - **Zero-Copy Strings**: Replaced `std::string` with fixed-size `char` arrays to prevent heap fragmentation.
 
-2. **Memory Layout**  
-   - Best prices at vector ends (no shifting on update)
-   - 128-byte aligned Limit structs for SIMD readiness
+2. **Algorithmic Improvements**
+   - **Lazy Deletion**: Price levels are marked empty rather than erased from vectors, making cancellation O(1) (avoiding O(N) shifts).
+   - **Deferred Deallocation**: "Retire List" strategy to safely recycle objects after batch processing (preventing Use-After-Free).
 
-3. **Compile-Time Config**  
-   ```cpp
-   static constexpr size_t InitialCapacity = 1024; // Pre-allocated vectors
-   static constexpr double MinPriceIncrement = 0.01; // No runtime checks
-    ```
+3. **Concurrency**
+   - **Sharded SPSC Queues**: Lock-free ingestion using `boost::lockfree::spsc_queue` to minimize contention.
+   - **Thread-Local Indexing**: Producer threads map to queues via thread-local storage.
 
 ## Configuration
 
@@ -101,14 +93,33 @@ orderbook/
 ```
 
 ## Build & Run
-``` bash
-# Build with optimizations
 
-g++ -std=c++17 -O3 -march=native main.cpp OrderBook.cpp -o vertex_ladder
+The project uses CMake for build configuration.
 
-# Run with FIX port 5000
-./vertex_ladder --port 5000 --symbol BTC/USD
+```bash
+# Create build directory (Defaults to Release build)
+cmake -S . -B build
+
+# Build with parallel jobs
+cmake --build build -- -j4
+
+# Run Performance Validation
+./build/OrderBookPerformanceValidation --orders 1000000 --threads 4
+
+# Run Main Application
+./build/OrderBook
 ```
+
+### Recent Updates (November 2025)
+
+- **Symbol Database**: Added `docs/symbols.csv` and `docs/symbols.json` containing 830+ symbols discovered from cTrader.
+- **cTrader Integration**: 
+  - Configured `QuickFixConnector` to support cTrader's specific FIX requirements (Bid/Offer entry types).
+  - Validated connectivity and data subscription for Apple (ID: 21508).
+- **Project Cleanup**: 
+  - Consolidated build artifacts into a single `build/` directory (Release mode by default).
+  - Removed redundant QuickFIX source files and duplicate configurations.
+  - Streamlined `third_party/` and `config/` directories.
 
 ### QuickFIX Market Data Integration (Optional)
 

@@ -221,7 +221,7 @@ ValidationResult OrderManager::validateOrder(const Order& order) const {
     
     // Validate symbol
     if (!isValidSymbol(order.symbol)) {
-        return ValidationResult::error("Invalid symbol: " + order.symbol);
+        return ValidationResult::error(std::string("Invalid symbol: ") + order.symbol);
     }
     
     // Validate filled quantity

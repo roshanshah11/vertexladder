@@ -14,6 +14,8 @@
 #include <quickfix/fix44/MarketDataSnapshotFullRefresh.h>
 #include <quickfix/fix44/MarketDataIncrementalRefresh.h>
 #include <quickfix/fix44/MarketDataRequest.h>
+#include <quickfix/fix44/SecurityList.h>
+#include <quickfix/fix44/SecurityListRequest.h>
 #include <memory>
 #include <string>
 
@@ -50,6 +52,7 @@ public:
     void onMessage(const FIX44::MarketDataIncrementalRefresh& message, const FIX::SessionID& sessionID) override;
     void onMessage(const FIX44::SequenceReset& message, const FIX::SessionID& sessionID) override;
     void onMessage(const FIX44::MarketDataRequestReject& message, const FIX::SessionID& sessionID) override;
+    void onMessage(const FIX44::SecurityList& message, const FIX::SessionID& sessionID) override;
 
 private:
     MarketDataPublisherPtr publisher_;
@@ -65,6 +68,7 @@ private:
     std::atomic<long> last_msg_seq_{0};
     std::atomic<uint64_t> messages_processed_{0};
     std::atomic<uint64_t> gaps_detected_{0};
+    FIX::SessionSettings settings_;
     void requestSnapshot(const FIX::SessionID& sessionID, const std::string& symbol);
 };
 
