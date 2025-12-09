@@ -1,4 +1,6 @@
-cmake_minimum_required(VERSION 3.15)
+cmake_minimum_required(VERSION 3.30)
+cmake_policy(SET CMP0169 OLD) # Allow FetchContent_Populate for header-only libs with old CMakeLists
+
 project(OrderBook VERSION 1.0.0 LANGUAGES CXX)
 
 # C++17 with optimizations
@@ -11,8 +13,28 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# Include FetchContent
+include(FetchContent)
+
+# Fetch nlohmann_json (Header only, manual population)
+FetchContent_Declare(
+    json
+    URL https://github.com/nlohmann/json/releases/download/v3.11.3/json.tar.xz
+)
+FetchContent_GetProperties(json)
+if(NOT json_POPULATED)
+    FetchContent_Populate(json)
+    add_library(nlohmann_json INTERFACE)
+    target_include_directories(nlohmann_json INTERFACE ${json_SOURCE_DIR}/include)
+endif()
+
+
+
 # Find dependencies
-find_package(Boost 1.70 REQUIRED)
+# Use Config mode (default) but don't require components to avoid broken config issues
+# Force Module mode to avoid issues with missing component configs (like boost_system)
+# Use Config mode (default)
+find_package(Boost 1.70 REQUIRED COMPONENTS headers)
 find_package(Threads REQUIRED)
 option(WITH_QUICKFIX "Enable QuickFIX integration" ON)
 if(WITH_QUICKFIX)
@@ -42,6 +64,7 @@ set(NETWORK_SOURCES
     src/Network/FixSession.cpp
     src/Network/FixMessageHandler.cpp
     src/Network/FixServer.cpp
+    src/Network/WsServer.cpp
 )
 
 # Utilities library sources
@@ -77,6 +100,7 @@ target_link_libraries(OrderBookNetwork PUBLIC
     OrderBookUtilities
     Boost::headers
     Threads::Threads
+    nlohmann_json
 )
 
 add_library(OrderBookUtilities STATIC ${UTILITY_SOURCES})
@@ -110,6 +134,7 @@ target_link_libraries(OrderBook PRIVATE
     OrderBookRisk
     Boost::headers 
     Threads::Threads
+    nlohmann_json
 )
 
 # Performance validation executable

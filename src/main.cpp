@@ -7,6 +7,8 @@
 #endif
 #include "orderbook/Utilities/Logger.hpp"
 #include "orderbook/Utilities/Config.hpp"
+#include "orderbook/Network/WsServer.hpp"
+#include <nlohmann/json.hpp>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -15,6 +17,40 @@
 #include <thread>
 
 using namespace orderbook;
+using json = nlohmann::json;
+
+// WebSocket Bridge for Market Data
+class WsMarketDataBridge : public IMarketDataSubscriber {
+public:
+    explicit WsMarketDataBridge(std::shared_ptr<WsServer> server) 
+        : server_(std::move(server)) {}
+
+    void onTrade(const Trade& trade, SequenceNumber sequence) override {
+        server_->updateLastTrade(trade.price, trade.quantity);
+    }
+
+    void onBookUpdate(const BookUpdate& update) override {
+        // For high-frequency updates, we rely on onBestPrices for the snapshot.
+        // Individual book updates are too frequent to broadcast directly in this mode.
+    }
+
+    void onBestPrices(const BestPrices& prices, SequenceNumber sequence) override {
+        double bid = prices.bid.value_or(0.0);
+        double bidQty = prices.bid_size.value_or(0.0);
+        double ask = prices.ask.value_or(0.0);
+        double askQty = prices.ask_size.value_or(0.0);
+        
+        server_->updateTopOfBook(bid, bidQty, ask, askQty);
+    }
+
+    void onDepth(const MarketDepth& depth, SequenceNumber sequence) override {
+        // Optional: Implement if full depth is needed on frontend
+        // For high-frequency, full depth might be too heavy to broadcast constantly
+    }
+
+private:
+    std::shared_ptr<WsServer> server_;
+};
 
 // Forward declaration for demo mode
 void runDemoMode(OrderBook& book, Logger& logger);
@@ -351,6 +387,16 @@ int main(int argc, char* argv[]) {
         auto market_data = std::make_shared<MarketDataPublisher>(logger);
         logger->info("Market data publisher initialized", "main");
         
+        // Initialize WebSocket Server
+        auto ws_server = std::make_shared<WsServer>();
+        ws_server->start(8080);
+        logger->info("WebSocket server started on port 8080", "main");
+        
+        // Initialize WebSocket Bridge
+        auto ws_bridge = std::make_shared<WsMarketDataBridge>(ws_server);
+        market_data->subscribe(ws_bridge);
+        logger->info("WebSocket bridge subscribed to market data", "main");
+        
         // Initialize OrderBook with all dependencies
         OrderBook book(risk_manager, market_data, logger);
         logger->info("OrderBook initialized with all dependencies", "main");
@@ -434,6 +480,9 @@ int main(int argc, char* argv[]) {
         }
         
         logger->info("OrderBook application completed successfully", "main");
+        
+        // Stop WebSocket server
+        ws_server->stop();
         
     } catch (const std::exception& e) {
         std::cerr << "Fatal error: " << e.what() << "\n";

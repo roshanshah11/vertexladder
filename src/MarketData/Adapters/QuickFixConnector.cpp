@@ -78,13 +78,7 @@ void QuickFixConnector::onCreate(const FIX::SessionID& sessionID) {
 void QuickFixConnector::onLogon(const FIX::SessionID& sessionID) {
     if (logger_) logger_->info("QuickFIX session logged on: " + sessionID.toString(), "QuickFixConnector::onLogon");
 
-    // cTrader Market Data Session Logic
-    std::string targetSubID;
-    try {
-        if (settings_.has(sessionID)) {
-            targetSubID = settings_.get(sessionID).getString("TargetSubID");
-        }
-    } catch (...) {}
+
 
     // On logon, subscribe for MD for all configured symbols
     std::string symbols = config_->getString("marketdata", "symbols", "");
@@ -423,10 +417,6 @@ void QuickFixConnector::onMessage(const FIX44::SecurityList& message, const FIX:
                 descVal = desc.getValue();
             }
             
-            // cTrader uses tag 1007 for SymbolName
-            if (group.isSetField(1007)) {
-                symNameVal = group.getField(1007);
-            }
 
             // Log if it looks like Apple
             if (descVal.find("Apple") != std::string::npos || descVal.find("AAPL") != std::string::npos || 

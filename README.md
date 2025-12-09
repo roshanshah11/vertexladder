@@ -110,16 +110,6 @@ cmake --build build -- -j4
 ./build/OrderBook
 ```
 
-### Recent Updates (November 2025)
-
-- **Symbol Database**: Added `docs/symbols.csv` and `docs/symbols.json` containing 830+ symbols discovered from cTrader.
-- **cTrader Integration**: 
-  - Configured `QuickFixConnector` to support cTrader's specific FIX requirements (Bid/Offer entry types).
-  - Validated connectivity and data subscription for Apple (ID: 21508).
-- **Project Cleanup**: 
-  - Consolidated build artifacts into a single `build/` directory (Release mode by default).
-  - Removed redundant QuickFIX source files and duplicate configurations.
-  - Streamlined `third_party/` and `config/` directories.
 
 ### QuickFIX Market Data Integration (Optional)
 
@@ -173,12 +163,3 @@ When MDSimulator detects a connection, it will send a snapshot and then random i
 MIT License - See [LICENSE](LICENSE) for details.
 
 ---
-
-This implementation provides a complete configuration system with:
-1. INI-file parsing
-2. Type-safe accessors
-3. Default value handling
-4. Runtime reconfiguration capability
-5. Clear documentation
-
-The system will automatically load configuration at startup and use it for all operational parameters.
