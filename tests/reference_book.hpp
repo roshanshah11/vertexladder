@@ -7,9 +7,12 @@
 
 #include "vertexladder/order_book.hpp"
 
-#include <functional>
+#include <algorithm>
+#include <iterator>
 #include <list>
 #include <map>
+#include <optional>
+#include <stdexcept>
 #include <unordered_map>
 #include <vector>
 

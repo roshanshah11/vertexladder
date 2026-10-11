@@ -142,10 +142,10 @@ int main(int argc, char** argv) {
                 static_cast<unsigned long long>(st.messages), static_cast<double>(bytes) / 1e9);
     std::printf("  book events     %llu  (A %llu, F %llu, E %llu, C %llu, X %llu, D %llu, U %llu)\n",
                 static_cast<unsigned long long>(st.book_events),
-                static_cast<unsigned long long>(st.by_type['A']), static_cast<unsigned long long>(st.by_type['F']),
-                static_cast<unsigned long long>(st.by_type['E']), static_cast<unsigned long long>(st.by_type['C']),
-                static_cast<unsigned long long>(st.by_type['X']), static_cast<unsigned long long>(st.by_type['D']),
-                static_cast<unsigned long long>(st.by_type['U']));
+                static_cast<unsigned long long>(st.by_type[static_cast<unsigned char>('A')]), static_cast<unsigned long long>(st.by_type[static_cast<unsigned char>('F')]),
+                static_cast<unsigned long long>(st.by_type[static_cast<unsigned char>('E')]), static_cast<unsigned long long>(st.by_type[static_cast<unsigned char>('C')]),
+                static_cast<unsigned long long>(st.by_type[static_cast<unsigned char>('X')]), static_cast<unsigned long long>(st.by_type[static_cast<unsigned char>('D')]),
+                static_cast<unsigned long long>(st.by_type[static_cast<unsigned char>('U')]));
     std::printf("  books           %zu symbols, peak %zu resting orders (sampled per chunk), %zu at close of file\n",
                 rep.book_count(), peak_resting, rep.resting_orders());
     std::printf("  replay time     %.2f s (parse + book updates, one thread, excludes gzip)\n", secs);
