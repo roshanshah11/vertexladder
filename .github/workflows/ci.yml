@@ -1,0 +1,52 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    name: linux / ${{ matrix.compiler }} / ${{ matrix.config }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { compiler: gcc,   config: release, cc: gcc-14,   cxx: g++-14,     flags: "-DCMAKE_BUILD_TYPE=Release" }
+          - { compiler: clang, config: release, cc: clang-18, cxx: clang++-18, flags: "-DCMAKE_BUILD_TYPE=Release" }
+          - { compiler: clang, config: asan+ubsan, cc: clang-18, cxx: clang++-18, flags: "-DCMAKE_BUILD_TYPE=Debug -DVL_SANITIZE=address,undefined -DVL_BUILD_BENCH=OFF" }
+          - { compiler: clang, config: tsan,    cc: clang-18, cxx: clang++-18, flags: "-DCMAKE_BUILD_TYPE=Debug -DVL_SANITIZE=thread -DVL_BUILD_BENCH=OFF" }
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: sudo apt-get update && sudo apt-get install -y libboost-dev libgtest-dev zlib1g-dev ninja-build
+      - name: tsan needs lower mmap ASLR entropy on 24.04 kernels
+        if: matrix.config == 'tsan'
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=${{ matrix.cc }} -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} ${{ matrix.flags }}
+      - name: build
+        run: cmake --build build
+      - name: test
+        env:
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+          TSAN_OPTIONS: halt_on_error=1
+        run: ctest --test-dir build --output-on-failure
+      - name: benchmark (shared runner, numbers are indicative only)
+        if: matrix.config == 'release'
+        run: ./build/bench_engine --ops 4000000 --warmup 500000 --runs 3
+
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: deps
+        run: brew install boost googletest ninja
+      - name: configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+      - name: build
+        run: cmake --build build
+      - name: test
+        run: ctest --test-dir build --output-on-failure
+      - name: benchmark (shared runner, numbers are indicative only)
+        run: ./build/bench_engine --ops 4000000 --warmup 500000 --runs 3
