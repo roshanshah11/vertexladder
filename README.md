@@ -10,15 +10,34 @@ Measured on an Apple M3 Pro laptop, one core for the book:
 
 | | |
 |---|---|
-| Matching engine, synthetic lit-book flow (48% add, 40% cancel, 7% marketable IOC, 5% replace) | **50 M book ops/s, 19.8 ns mean**, p99 < 125 ns |
-| Same flow with 1M orders resting (out of cache) | 7 to 12 M ops/s, ~115 ns mean |
-| Full NASDAQ trading day (Dec 30, 2019): 268.7M messages, 8,892 books | **29 to 35 s, 7.7 to 9.4 M messages/s** |
+| Matching engine, synthetic lit-book flow (48% add, 40% cancel, 7% marketable IOC, 5% replace) | **49 M book ops/s, 20 ns mean**, p99.9 < 125 ns |
+| Same flow with 1M orders resting (out of cache) | 13 M ops/s, 77 ns mean |
+| Full NASDAQ trading day (Dec 30, 2019): 268.7M messages, 8,892 books | **26 s, 10.4 M messages/s** |
 | ITCH validation: NASDAQ 'E' executions that hit the order our book had at the best price / first in line | **100.00% / 99.82%** of 5.72M |
-| FIX order round trip over loopback TCP, one order in flight | **15 µs p50** on a loaded machine, 6 µs above bare TCP in the same window |
+| FIX order round trip over loopback TCP, one order in flight | **11 to 12 µs p50**, 4 to 5 µs above bare TCP (7.1 µs) in the same window |
 
 Method, raw output and caveats (the M3's clock ticks every 41.7 ns, and what that does to
 percentiles) are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). The reasoning behind every design
 choice is in [docs/DESIGN.md](docs/DESIGN.md).
+
+## What the NASDAQ day says
+
+The same book, rebuilt from NASDAQ's feed, answers two market-making questions
+([docs/RESEARCH.md](docs/RESEARCH.md)):
+
+- **Queue imbalance predicts the next tick.** With a one-tick spread, when the bid has far more size
+  than the ask, the next mid move is up 78% of the time (21% when it's the other way round); the
+  sign of the imbalance calls the next move 63% of the time over 122M samples. With wider spreads
+  it drops to 57%, the large-tick effect Gould and Bonart describe.
+- **Queue position costs you twice.** Orders that join behind 10,000+ shares fill 1.8% of the time
+  against 9.5% at the front, and 73% of their fills are underwater 10 seconds later against 52%.
+  Inside the same stock, the longer queue fills less often in 92% of 914 stocks and gets the worse
+  fills in 70% of 481.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="analysis/results/2019-12-30-dark.png">
+  <img alt="Queue imbalance vs next mid move, and fill rate and fills underwater vs queue position" src="analysis/results/2019-12-30-light.png">
+</picture>
 
 ## Architecture
 
@@ -101,8 +120,9 @@ src/fix/              FIX codec
 src/gateway/          FIX gateway (Boost.Asio)
 src/apps/             vl_server, vl_fix_client
 bench/                bench_engine, bench_itch, bench_hop, bench_tcp_baseline
+analysis/             microstructure study on the ITCH day, plots, results
 tests/                unit, differential, hash map, ring, FIX, ITCH and gateway tests
-docs/                 DESIGN.md, BENCHMARKS.md
+docs/                 DESIGN.md, BENCHMARKS.md, RESEARCH.md
 ```
 
 ## Not done yet

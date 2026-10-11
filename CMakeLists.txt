@@ -67,6 +67,8 @@ if(VL_BUILD_BENCH)
   if(ZLIB_FOUND)
     add_executable(bench_itch bench/bench_itch.cpp)
     target_link_libraries(bench_itch PRIVATE vl_core ZLIB::ZLIB)
+    add_executable(microstructure analysis/microstructure.cpp)
+    target_link_libraries(microstructure PRIVATE vl_core ZLIB::ZLIB)
   endif()
 endif()
 

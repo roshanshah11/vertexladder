@@ -3,11 +3,11 @@
 Machine: Apple M3 Pro (5 performance + 6 efficiency cores, 128-byte cache lines, 16 MB L2 on the
 performance cluster), 18 GB, macOS 26.6, Apple clang 21, `-O3`, CMake Release, no `-march=native`.
 
-This is a laptop that was doing other work during the runs (iOS Simulator tests, load average 6 to
-16), and macOS can't pin threads to cores. Background load only ever slows a run down, so for
-throughput I report the median and the range across runs, and every latency table sits next to a
-baseline measured in the same window. Re-running on a quiet machine gives faster numbers, not
-slower ones.
+The numbers below are from one clean pass on Oct 11, 2026 with the laptop otherwise idle apart from
+a music player (load average 5 to 6 throughout). macOS can't pin threads to cores, so throughput is
+reported as the median and the range across runs, and the FIX latency sits next to a bare-TCP
+baseline measured in the same window. Earlier runs with heavy background load (iOS Simulator tests,
+load average up to 16) were up to 40% slower; background load only ever slows a run down.
 
 Reproduce:
 
@@ -54,25 +54,25 @@ replaces, which is also what most of a real feed is.
 | | ~20k resting orders (fits in L2) | ~1M resting orders (doesn't) |
 |---|---|---|
 | op mix | 47.6% add, 40.4% cancel, 7.0% aggressive IOC, 5.0% replace | 49.2 / 38.9 / 7.0 / 5.0 |
-| throughput | **50.5 M ops/s**, median of 9 (46.1 to 51.2) | **8.8 M ops/s**, median of 3 (7.3 to 12.3) |
-| mean per op | **19.8 ns** | **114 ns** |
-| per-op readings p50 / p99 / p99.9 | 0 / 83 / 167 ns (true p99 < 125 ns) | 83 / 500 / 4,833 ns |
+| throughput | **49.1 M ops/s**, median of 9 (32.9 to 52.0) | **13.0 M ops/s**, median of 3 (11.8 to 14.1) |
+| mean per op | **20.4 ns** | **77 ns** |
+| per-op readings p50 / p99 / p99.9 | 0 / 83 / 83 ns (true p99.9 < 125 ns) | 83 / 333 / 500 ns |
 | book at end | 19,361 orders, 154 levels | 979,844 orders, 1,220 levels |
 
 Same code in both columns. With 20k orders the node pool (620 KB) and the id map fit in L2. At 1M
 orders the pool is 31 MB and the id map 64 MB, so cancelling a random order costs a couple of cache
-misses (cancel p50 reading goes from under one tick to 167 ns).
+misses (cancel p50 reading goes from under one tick to 125 ns).
 
 Per-op readings, 20k column:
 
 ```
   op                    count     mean      p50      p90      p99      p99.9        max
-  add (passive)       8552369     21.6        0       42       83        167     612625
-  aggressive IOC      1260687     20.5        0       42       83        167     371000
-  cancel              7288410     19.9        0       42       42        167     631500
-  replace              898534     34.3       42       83       83        167     139250
-  all                18000000     21.5        0       42       83        167     631500
-  (empty timer)       1000000      4.7        0       42       42         42       3208
+  add (passive)       8552369     17.7        0       42       42         83      10708
+  aggressive IOC      1260687     16.6        0       42       42         83       6708
+  cancel              7288410     16.3        0       42       42         83       9417
+  replace              898534     31.5       42       83       83        125       8750
+  all                18000000     17.7        0       42       83         83      10708
+  (empty timer)       1000000      4.4        0       42       42         42        167
 ```
 
 ## 2. A full NASDAQ trading day (ITCH 5.0)
@@ -89,9 +89,9 @@ excluded.
 | messages | 268,744,780 (8.25 GB decompressed) |
 | book events | 263,241,937: 117.1M adds (A), 1.5M adds with MPID (F), 5.7M executions (E), 0.1M executions at a price (C), 2.8M partial cancels (X), 114.4M deletes (D), 21.6M replaces (U) |
 | books | 8,892 symbols; at least 1.92M orders resting at once (sampled once per 64 MB chunk) |
-| replay time | **28.6 to 34.8 s** over four runs |
-| throughput | **7.7 to 9.4 M messages/s, 106 to 129 ns per message** |
-| per book event, individually timed | mean 99 ns; readings p50 42, p99 583, p99.9 1,167 ns |
+| replay time | **25.6 to 26.1 s** over two runs (28.6 to 34.8 s under heavy background load) |
+| throughput | **10.3 to 10.5 M messages/s, 95 to 97 ns per message** |
+| per book event, individually timed (loaded run) | mean 99 ns; readings p50 42, p99 583, p99.9 1,167 ns |
 | integrity | 0 references to unknown orders, 0 over-fills, 0 malformed messages, every book empty at end of file |
 | validation | of 5,722,824 'E' executions, **100.0000%** hit an order at our best price and **99.8154%** hit the exact order our book had first in line (identical in both validation runs) |
 
@@ -124,8 +124,8 @@ every sell trades.
 
 | ns (41.7 ns resolution) | p50 | p90 | p99 | p99.9 |
 |---|---|---|---|---|
-| command → its Accepted event (sent before matching) | 167 | 291 | 375 | 666 |
-| crossing order → its Fill event (includes the match) | 250 | 333 | 458 | 833 |
+| command → its Accepted event (sent before matching) | 167 | 250 | 334 | 667 |
+| crossing order → its Fill event (includes the match) | 250 | 292 | 417 | 750 |
 
 **FIX round trip** (`vl_fix_client` against `vl_server`, same machine): one NewOrderSingle in
 flight at a time, 200,000 orders, first 10% discarded. Each sample covers the client socket, kernel
@@ -135,15 +135,14 @@ orders that cross, to their own fill report (150=F, which includes the match). T
 so with no queueing it measures service time on an otherwise idle system, not latency under load
 (no coordinated-omission correction). Bare TCP in the same window is the baseline.
 
-| µs, same window, load average ~10 | p50 | p90 | p99 | p99.9 |
+| µs, same window, three runs (range) | p50 | p90 | p99 | p99.9 |
 |---|---|---|---|---|
-| order → ack | **15.1** | 34.2 | 79.9 | 223.5 |
-| crossing order → fill | **16.8** | 36.8 | 82.2 | 240.9 |
-| bare loopback TCP ping-pong, no FIX (`bench_tcp_baseline`) | 9.2 | 23.3 | 52.0 | 106.3 |
+| order → ack | **11.2 to 12.3** | 17.2 to 19.8 | 33.7 to 43.0 | 64 to 80 |
+| crossing order → fill | **12.4 to 13.7** | 18.8 to 21.4 | 35.8 to 44.6 | 64 to 83 |
+| bare loopback TCP ping-pong, no FIX (`bench_tcp_baseline`) | 7.1 to 7.2 | 10.8 to 11.9 | 17.6 to 27.9 | 34 to 58 |
 
-So the gateway, both ring hops, the engine and FIX encoding add about 6 µs at the median on a busy
-machine. On a quieter run earlier the same day (load ~6, gateway code from before the review fixes)
-it was 10.2 µs against 7.0 µs bare, about 3 µs.
+So the gateway, both ring hops, the engine and FIX encoding add about 4 to 5 µs at the median over
+what the kernel costs anyway; under heavy background load the gap was about 6 µs.
 
 How it got there: with Boost.Asio's reactor driving the sockets, the round trip was 53 µs.
 `io_context::poll()` measured about 12 µs per call on macOS even with nothing ready, and an order

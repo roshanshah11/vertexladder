@@ -193,7 +193,7 @@ about 2x in the benchmark until I fixed it.
 The engine thread busy-polls its input ring. Waking a sleeping thread costs microseconds,
 more than matching an order, so trading systems spin on a dedicated core.
 In-process, a command's ack comes back from the engine thread about 170 ns (p50) after it's pushed,
-and a crossing order's own fill about 250 ns (`bench_hop`, on a loaded machine).
+and a crossing order's own fill about 250 ns (`bench_hop`).
 
 ## 6. NASDAQ ITCH 5.0 replay
 

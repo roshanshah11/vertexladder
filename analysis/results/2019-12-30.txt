@@ -1,0 +1,63 @@
+NASDAQ ITCH 5.0: /Users/roshanshah/Projects/vertexladder-data/12302019.NASDAQ_ITCH50.gz, 268744780 messages, 8892 books
+
+1) QUEUE IMBALANCE -> NEXT MID MOVE  (regular hours, every book update is a sample)
+
+  spread = 1 tick: 122025752 samples resolved by a later mid move (122383194 taken)
+  imbalance             samples      P(up)
+  [-1.0, -0.8)      8999357      21.2%
+  [-0.8, -0.6)     10294380      28.1%
+  [-0.6, -0.4)     13012815      35.0%
+  [-0.4, -0.2)     14100872      41.0%
+  [-0.2, +0.0)     13761930      45.7%
+  [+0.0, +0.2)     16406665      51.3%
+  [+0.2, +0.4)     14490301      57.1%
+  [+0.4, +0.6)     11984356      63.2%
+  [+0.6, +0.8)     10560692      70.1%
+  [+0.8, +1.0]      8414384      78.4%
+  sign(I) calls the next move: 63.1% of samples
+
+  spread > 1 tick: 132508531 samples resolved by a later mid move (132658721 taken)
+  imbalance             samples      P(up)
+  [-1.0, -0.8)     14388127      40.7%
+  [-0.8, -0.6)      8540478      39.8%
+  [-0.6, -0.4)     10965709      40.7%
+  [-0.4, -0.2)     13118218      43.3%
+  [-0.2, +0.0)     11054461      45.6%
+  [+0.0, +0.2)     27952905      50.8%
+  [+0.2, +0.4)     14311719      56.2%
+  [+0.4, +0.6)      9400100      59.4%
+  [+0.6, +0.8)      9319057      60.2%
+  [+0.8, +1.0]     13457757      58.9%
+  sign(I) calls the next move: 56.6% of samples
+
+  Per symbol, |I| > 0.6, spread any (sign(I) vs next move), most active and named:
+  QQQ         1068530 calls   77.0% right
+  TQQQ         720791 calls   72.2% right
+  IWM          705958 calls   75.6% right
+  SPY          668995 calls   75.4% right
+  GOOGL        499565 calls   55.2% right
+  URTY         493521 calls   87.9% right
+  GOOG         418157 calls   54.8% right
+  AMD          388105 calls   74.1% right
+  AAPL         385994 calls   62.6% right
+  MSFT         375270 calls   73.7% right
+  AMZN         276533 calls   52.9% right
+  NVDA         195580 calls   56.8% right
+  TSLA         238712 calls   55.1% right
+  INTC         175551 calls   80.5% right
+
+2) QUEUE POSITION AT ENTRY -> FILL RATE AND MARKOUT  (orders joining the best price)
+  Markout: mid N seconds after the fill minus the fill price, from the resting order's side,
+  cents per share, fills made while the spread was 1 tick. A passive fill starts at +0.5c.
+  shares ahead              orders ever fill   median 1s  median 10s   under 10s       fills
+  0 (new best level)      13523697     9.54%    -0.500 c    -0.500 c       52.4%      661860
+  1-499                   18468035     8.13%    -0.500 c    -0.500 c       57.8%     1053406
+  500-1,999               13532391     3.66%    -0.500 c    -0.500 c       63.1%      539330
+  2,000-9,999              9417221     2.40%    -0.500 c    -0.500 c       67.3%      257554
+  10,000+                  4571422     1.81%    -0.500 c    -0.500 c       72.8%       99832
+
+  Within the same stock, long queue (2,000+ ahead) vs short queue (1-499 ahead):
+  fill rate:   914 stocks with 200+ joins of each; long queue fills less often in 91.6%,
+               median difference -5.62 percentage points
+  10s markout: 481 stocks with 50+ one-tick fills of each; long queue's fills are worse in 69.9%,
+               median difference -0.073 c/share (means clipped to +/-5c)
