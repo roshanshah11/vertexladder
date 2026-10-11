@@ -1,5 +1,7 @@
 # VertexLadder
 
+[![ci](https://github.com/roshanshah11/vertexladder/actions/workflows/ci.yml/badge.svg)](https://github.com/roshanshah11/vertexladder/actions/workflows/ci.yml)
+
 A price-time priority matching engine in C++20, with a FIX 4.4 order-entry gateway and a
 NASDAQ ITCH 5.0 replayer that rebuilds NASDAQ's order book for every stock it trades, order by
 order, from NASDAQ's own feed.
