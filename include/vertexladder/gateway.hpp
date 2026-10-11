@@ -30,6 +30,7 @@ struct GatewayConfig {
     std::vector<std::string> symbols;  // index in this list = engine book id
     int price_decimals = 4;            // FIX "101.25" -> 1012500 ticks
     bool cancel_on_disconnect = true;
+    Qty max_order_qty = 1'000'000;     // pre-trade fat-finger check
 };
 
 class FixGateway {

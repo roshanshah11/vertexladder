@@ -118,11 +118,14 @@ std::vector<Op> generate(std::size_t n, std::uint64_t seed) {
         const double p_cancel = std::min(0.95, 0.47 * static_cast<double>(live.ids.size()) / kTargetResting);
         Op op{};
         if (r < 0.07) {
+            // Marketable: priced at the opposite touch or through it, so it always trades.
             const Side s = u(rng) < 0.5 ? Side::Buy : Side::Sell;
-            const Price through = depth(rng);  // 0 = at the touch, more = sweep deeper
+            const Price through = depth(rng);  // 0 = take the touch only, more = sweep deeper
+            const auto touch = s == Side::Buy ? shadow.best_ask() : shadow.best_bid();
+            const Price ref = touch ? *touch : mid;
             op.kind = Op::Aggress;
             op.order = {next_id++, s, OrderType::Limit, TimeInForce::IOC,
-                        s == Side::Buy ? mid + through : mid - through, 100 * lots(rng)};
+                        s == Side::Buy ? ref + through : ref - through, 100 * lots(rng)};
             shadow.submit(op.order);
         } else if (r < 0.12 && !live.ids.empty()) {
             op.kind = Op::Replace;
@@ -159,9 +162,15 @@ std::vector<Op> generate(std::size_t n, std::uint64_t seed) {
 struct CountingListener : NullListener {
     std::uint64_t trades = 0;
     std::uint64_t volume = 0;
+    std::uint64_t ops_that_traded = 0;
+    OrderId last_taker = 0;
     void on_trade(const Trade& t) {
         ++trades;
         volume += t.qty;
+        if (t.taker_id != last_taker) {
+            ++ops_that_traded;
+            last_taker = t.taker_id;
+        }
     }
 };
 
@@ -207,7 +216,7 @@ int main(int argc, char** argv) {
 
     // 1) Throughput: one timestamp before and after the timed stream.
     std::vector<double> rates;
-    std::uint64_t trades = 0;
+    std::uint64_t trades = 0, traded_ops = 0;
     std::size_t resting = 0, bid_levels = 0, ask_levels = 0;
     for (std::size_t run = 0; run < runs; ++run) {
         Book book(kBookHint);
@@ -218,6 +227,7 @@ int main(int argc, char** argv) {
         const double secs = static_cast<double>(t1 - t0) * ns_per_tick * 1e-9;
         rates.push_back(static_cast<double>(n_ops - warmup) / secs);
         trades = book.listener().trades;
+        traded_ops = book.listener().ops_that_traded;
         resting = book.order_count();
         bid_levels = book.level_count(Side::Buy);
         ask_levels = book.level_count(Side::Sell);
@@ -227,8 +237,10 @@ int main(int argc, char** argv) {
     std::printf("THROUGHPUT  (%zu timed ops, median of %zu runs)\n", n_ops - warmup, runs);
     std::printf("  %.2f M ops/s   mean %.1f ns/op   (min run %.2f, max run %.2f M ops/s)\n",
                 median / 1e6, 1e9 / median, rates.front() / 1e6, rates.back() / 1e6);
-    std::printf("  trades %llu, book at end: %zu orders, %zu bid / %zu ask levels\n\n",
-                static_cast<unsigned long long>(trades), resting, bid_levels, ask_levels);
+    std::printf("  trades %llu (from %llu ops = %.1f%% of all ops), book at end: %zu orders, %zu bid / %zu ask levels\n\n",
+                static_cast<unsigned long long>(trades), static_cast<unsigned long long>(traded_ops),
+                100.0 * static_cast<double>(traded_ops) / static_cast<double>(n_ops),
+                resting, bid_levels, ask_levels);
 
     // 2) Latency: timestamp around every single op. Adds the clock cost (~6 ns on
     // Apple Silicon, ~7 ns rdtsc) to each sample and is quantized to the clock tick.

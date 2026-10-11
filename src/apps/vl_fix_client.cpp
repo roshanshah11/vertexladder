@@ -3,9 +3,10 @@
 //
 //   vl_fix_client [--port 9878] [--orders 100000] [--symbol AAPL]
 //
-// Sends one NewOrderSingle at a time and waits for its first ExecutionReport (the
-// ack), so each sample is one full round trip over loopback TCP. Orders alternate
-// buy and sell at the same price, so half of them trade.
+// Sends one NewOrderSingle at a time and waits for its reports, so each sample is one full
+// round trip over loopback TCP. Orders alternate buy and sell at the same price, so every
+// sell trades against the buy before it. Closed loop: with one order in flight there is no
+// queueing, so this is service time on an idle system, not latency under load.
 
 #include "fix_test_client.hpp"
 #include "vertexladder/histogram.hpp"
@@ -33,31 +34,50 @@ int main(int argc, char** argv) {
     }
 
     using sc = std::chrono::steady_clock;
-    vl::Histogram rtt;  // nanoseconds
-    std::size_t warm = n / 10;
+    // ack: send -> the order's first ExecutionReport (150=0), every order.
+    // fill: send -> the order's own fill report (150=F), for the sells, which cross the
+    // resting buy before them; this one includes the match.
+    // Recorded in 10 ns units: the histogram is exact below 65,536 units, so up to 655 us.
+    vl::Histogram ack, fill;
+    auto ns_since = [](sc::time_point t0) {
+        return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(sc::now() - t0).count()) / 10;
+    };
+    const std::size_t warm = n / 10;
     for (std::size_t i = 0; i < n + warm; ++i) {
         const std::string id = "o" + std::to_string(i);
+        const bool sell = i & 1;
         const auto t0 = sc::now();
         c.send("D", [&](vl::fix::Writer& w) {
             w.add(vl::fix::tag::ClOrdID, id).add(vl::fix::tag::Symbol, symbol);
-            w.add(vl::fix::tag::Side, (i & 1) ? '2' : '1').add(vl::fix::tag::OrderQty, std::uint64_t{100});
+            w.add(vl::fix::tag::Side, sell ? '2' : '1').add(vl::fix::tag::OrderQty, std::uint64_t{100});
             w.add(vl::fix::tag::OrdType, '2').add(vl::fix::tag::Price, "100");
         });
-        for (;;) {
+        bool acked = false, filled = !sell;
+        while (!acked || !filled) {
             auto m = c.next();
             if (!m) {
                 std::fprintf(stderr, "timed out waiting for %s\n", id.c_str());
                 return 1;
             }
-            if (m->type() == "8" && m->get(vl::fix::tag::ClOrdID) == id) break;
+            if (m->type() != "8" || m->get(vl::fix::tag::ClOrdID) != id) continue;
+            const std::string et = m->get(vl::fix::tag::ExecType);
+            if (et == "0" && !acked) {
+                acked = true;
+                if (i >= warm) ack.record(ns_since(t0));
+            } else if (et == "F" && !filled) {
+                filled = true;
+                if (i >= warm) fill.record(ns_since(t0));
+            }
         }
-        const auto t1 = sc::now();
-        if (i >= warm) rtt.record(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()));
     }
-    auto us = [](std::uint64_t ns) { return static_cast<double>(ns) / 1000.0; };
-    std::printf("%zu orders, round trip over loopback TCP (us): mean %.1f  p50 %.1f  p90 %.1f  p99 %.1f  p99.9 %.1f  max %.1f\n",
-                n, rtt.mean() / 1000.0, us(rtt.quantile(0.5)), us(rtt.quantile(0.9)), us(rtt.quantile(0.99)),
-                us(rtt.quantile(0.999)), us(rtt.max()));
+    auto row = [](const char* name, const vl::Histogram& h) {
+        auto us = [](std::uint64_t tens_of_ns) { return static_cast<double>(tens_of_ns) / 100.0; };
+        std::printf("%-30s mean %.1f  p50 %.1f  p90 %.1f  p99 %.1f  p99.9 %.1f  max %.1f\n", name, h.mean() / 100.0,
+                    us(h.quantile(0.5)), us(h.quantile(0.9)), us(h.quantile(0.99)), us(h.quantile(0.999)), us(h.max()));
+    };
+    std::printf("%zu orders, one in flight (closed loop), loopback TCP, microseconds:\n", n);
+    row("  order -> ack (150=0)", ack);
+    row("  crossing order -> fill (150=F)", fill);
     c.send("5");
     return 0;
 }

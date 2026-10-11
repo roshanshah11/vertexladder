@@ -98,7 +98,7 @@ public:
         if (left == 0) return;
         if (market || o.tif != TimeInForce::GTC)
             return listener_.on_cancel(o.id, left, CancelReason::IocRemainder);
-        rest(o.id, o.side, o.price, left);
+        rest(o.id, o.side, o.price, left, o.qty - left);
     }
 
     bool cancel(OrderId id) {
@@ -113,16 +113,22 @@ public:
         return true;
     }
 
-    // Cancel/replace. new_qty is the new open quantity. Cutting size at the same price
-    // keeps the order's place in the queue; any other change loses time priority (the
-    // order goes to the back, and can trade if the new price crosses).
-    bool replace(OrderId id, Price new_price, Qty new_qty) {
+    // Cancel/replace, FIX style: new_total is the order's new total quantity, including
+    // what has already filled. The book is the only place that knows the filled amount for
+    // certain (a fill can be in flight while the client sends the replace), so the open
+    // quantity is computed here: new open = new_total - filled. A total at or below what
+    // has filled is rejected. Cutting size at the same price keeps the order's place in
+    // the queue; any other change loses time priority (it goes to the back of the new
+    // level, and trades if the new price crosses).
+    bool replace(OrderId id, Price new_price, Qty new_total) {
         const std::uint32_t* h = id ? index_.find(id) : nullptr;
         if (!h) {
             listener_.on_reject(id, RejectReason::UnknownOrder);
             return false;
         }
-        if (new_qty == 0) {
+        const Handle handle = *h;
+        OrderNode& n = orders_[handle];
+        if (new_total <= n.filled) {
             listener_.on_reject(id, RejectReason::InvalidQuantity);
             return false;
         }
@@ -130,20 +136,20 @@ public:
             listener_.on_reject(id, RejectReason::InvalidPrice);
             return false;
         }
-        const Handle handle = *h;
-        OrderNode& n = orders_[handle];
+        const Qty new_open = new_total - n.filled;
         Level& lvl = levels_[n.level];
-        if (new_price == lvl.price && new_qty <= n.qty) {
-            lvl.total -= n.qty - new_qty;
-            n.qty = new_qty;
-            listener_.on_replace(id, new_price, new_qty);
+        if (new_price == lvl.price && new_open <= n.qty) {
+            lvl.total -= n.qty - new_open;
+            n.qty = new_open;
+            listener_.on_replace(id, new_price, new_open);
             return true;
         }
         const Side side = n.side;
+        const Qty filled = n.filled;
         remove(handle);
-        listener_.on_replace(id, new_price, new_qty);
-        const Qty left = match(id, side, new_price, new_qty);
-        if (left) rest(id, side, new_price, left);
+        listener_.on_replace(id, new_price, new_open);
+        const Qty left = match(id, side, new_price, new_open);
+        if (left) rest(id, side, new_price, left, filled + (new_open - left));
         return true;
     }
 
@@ -264,12 +270,15 @@ public:
     }
 
 private:
-    struct OrderNode {  // 32 bytes: two per cache line
+    // 32 bytes, aligned to 32 so a node never straddles a cache line (glibc's malloc
+    // only guarantees 16-byte alignment, so without alignas some would).
+    struct alignas(32) OrderNode {
         OrderId id;
         Qty qty;  // open quantity
         Handle prev;
         Handle next;  // also the free-list link while the node is unused
         Handle level;
+        Qty filled;  // executed so far, for FIX-style replace
         Side side;
     };
     static_assert(sizeof(OrderNode) == 32);
@@ -339,6 +348,7 @@ private:
                 OrderNode& maker = orders_[h];
                 const Qty fill = std::min(qty, maker.qty);
                 maker.qty -= fill;
+                maker.filled += fill;
                 lvl.total -= fill;
                 qty -= fill;
                 const Handle next = maker.next;
@@ -361,12 +371,12 @@ private:
         return qty;
     }
 
-    void rest(OrderId id, Side side, Price price, Qty qty) {
+    void rest(OrderId id, Side side, Price price, Qty qty, Qty filled = 0) {
         const Handle li = find_or_add_level(side, price);
         const Handle h = alloc_order();
         Level& lvl = levels_[li];
         OrderNode& n = orders_[h];
-        n = OrderNode{id, qty, lvl.tail, kNil, li, side};
+        n = OrderNode{id, qty, lvl.tail, kNil, li, filled, side};
         if (lvl.tail != kNil) orders_[lvl.tail].next = h;
         else lvl.head = h;
         lvl.tail = h;

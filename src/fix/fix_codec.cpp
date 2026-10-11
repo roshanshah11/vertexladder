@@ -128,8 +128,9 @@ std::optional<Price> parse_price(std::string_view s, int decimals) noexcept {
     std::uint64_t scale = 1;
     for (int i = 0; i < decimals; ++i) scale *= 10;
     for (std::size_t i = frac.size(); i < static_cast<std::size_t>(decimals); ++i) fr *= 10;
-    if (w > static_cast<std::uint64_t>(INT64_MAX) / scale) return std::nullopt;
-    const auto v = static_cast<Price>(w * scale + fr);
+    // Overflow: the whole part times scale, plus the fraction, must fit in int64.
+    if (w > (static_cast<std::uint64_t>(INT64_MAX) - fr) / scale) return std::nullopt;
+    const auto v = static_cast<Price>(w * scale + fr);  // <= INT64_MAX, so negating is safe
     return neg ? -v : v;
 }
 

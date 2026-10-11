@@ -108,3 +108,9 @@ TEST(FixCodec, UtcTimestampFormat) {
     EXPECT_EQ(ts[17], '.');
     EXPECT_EQ(ts.substr(0, 2), "20");
 }
+
+TEST(FixCodec, PriceOverflowRejected) {
+    EXPECT_FALSE(parse_price("922337203685477.9999", 4));
+    EXPECT_FALSE(parse_price("-922337203685477.5808", 4));
+    EXPECT_TRUE(parse_price("922337203685477.5807", 4));
+}

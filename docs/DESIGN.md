@@ -8,7 +8,7 @@ What each part does, the alternatives, and why this one. Numbers are from an App
 ```
  FIX clients ──TCP──▶ gateway thread ──SPSC ring──▶ engine thread ──SPSC ring──▶ gateway thread ──TCP──▶ clients
                       (sockets, FIX,      Command        (all books,      EngineEvent     (ExecutionReports)
-                       ClOrdIDs, seq #s)  56 bytes        matching)        56 bytes
+                       ClOrdIDs, seq #s)  40 bytes        matching)        48 bytes
 ```
 
 Every book lives on one thread, and that thread does nothing but match. The gateway thread
@@ -53,10 +53,10 @@ bids_ (vector, worst ... best)            levels_ pool                     order
 index_: flat hash map  order id ──▶ node handle
 ```
 
-- **Orders** are 32-byte nodes in one contiguous pool, two per 64-byte cache line (one quarter of
-  Apple's 128-byte line). A node holds id, open quantity, prev/next links, its level and its side.
-  No price (the level has it) and no timestamp: time priority is simply the order's position in
-  its level's FIFO.
+- **Orders** are 32-byte nodes in one contiguous pool, aligned to 32 so none straddles a cache line
+  (two per 64-byte x86 line, four per 128-byte Apple line). A node holds id, open quantity, filled
+  quantity, prev/next links, its level and its side. No price (the level has it) and no
+  timestamp: time priority is simply the order's position in its level's FIFO.
 - **Handles, not pointers.** Nodes are addressed by 32-bit indices. Indices survive the pool's
   vector growing (pointers would dangle), and they're half the size.
 - **Levels** are pooled the same way: price, total open quantity, order count, head and tail.
@@ -104,9 +104,14 @@ Alternatives considered:
 - **FOK**: before touching anything, add up the quantity available at prices it could take; if
   that's short, cancel the whole order without trading.
 - **Market**: a limit at +/- infinity with IOC semantics.
-- **Cancel/replace**: cutting size at the same price keeps the order's place in line; any other
-  change (new price, more size) takes it out and re-enters it at the back, where it can trade if
-  the new price crosses. This is how most venues treat priority.
+- **Cancel/replace**: the new quantity is the order's new *total*, including what has already
+  filled, as in FIX. The book tracks each order's filled amount and computes the new open
+  quantity itself (total minus filled), and rejects a total at or below what has filled. This
+  matters because the book is the only place that knows the filled amount for certain: a fill can
+  be on its way back to the gateway while the client's replace is on its way in. Cutting size at
+  the same price keeps the order's place in line; any other change (new price, more size) takes it
+  out and re-enters it at the back, where it can trade if the new price crosses. This is how most
+  venues treat priority.
 - Rejects: zero quantity, non-positive limit price, duplicate id, unknown id.
 - Not implemented: self-trade prevention, iceberg/hidden orders, auctions, stop orders, pegs.
 
@@ -179,13 +184,16 @@ about 2x in the benchmark until I fixed it.
   must never drop an event); the gateway applies backpressure. A queue that drops on full
   loses orders silently under exactly the load you're benchmarking.
 - **Testing it honestly**: the two-thread stress test checks every message arrives once, in
-  order, intact, and CI runs it under ThreadSanitizer. When I weakened release/acquire to
-  relaxed, the test and TSan both still passed on the M3. So the correctness argument for the
-  orderings is the happens-before reasoning above, not the test.
+  order, intact, and CI runs it under ThreadSanitizer. When I weakened every ordering to relaxed,
+  the stress test still passed, and ThreadSanitizer stayed quiet in six of my runs on the M3
+  (-O0 to -O2); a reviewer running the same experiment did get a TSan report. A check that only
+  sometimes notices a missing barrier isn't proof, so the correctness argument for the orderings
+  is the happens-before reasoning above, not the test.
 
 The engine thread busy-polls its input ring. Waking a sleeping thread costs microseconds,
 more than matching an order, so trading systems spin on a dedicated core.
-In-process, a command's first event comes back 83 to 125 ns (p50) after it's pushed (`bench_hop`).
+In-process, a command's ack comes back from the engine thread about 170 ns (p50) after it's pushed,
+and a crossing order's own fill about 250 ns (`bench_hop`, on a loaded machine).
 
 ## 6. NASDAQ ITCH 5.0 replay
 
@@ -224,19 +232,36 @@ queue. Over the Dec 30, 2019 file:
   CumQty, LeavesQty, AvgPx), cancels, replaces and rejects; OrderCancelReject when a cancel or
   replace arrives too late. ClOrdID chains follow FIX (the cancel's report carries the cancel's
   ClOrdID and the original as OrigClOrdID). Cancel-on-disconnect is on by default.
-- **The race worth knowing about**: a client sends a cancel while a fill for that order is
-  already in the engine's output ring. The gateway sees the fill first and the order is done,
-  but the cancel is still in flight. The gateway keeps the order's state until the engine's
-  reject for that cancel arrives, then answers it with OrderCancelReject, so every request gets
-  exactly one answer.
+- **The races worth knowing about**: the engine's output and the client's input cross in
+  flight.
+  - A client replaces an order while a fill for it is still in the engine's output ring. If the
+    gateway computed the new open quantity from its own CumQty, which is stale by that fill, the
+    order would overfill. So the gateway forwards the FIX total and the engine, which knows the
+    true filled amount, computes open = total - filled. `GatewayRace` reproduces this
+    deterministically by holding the engine back until all three commands are queued.
+  - A client cancels while the fill that completes the order is in flight. The gateway sees the
+    fill first and the order is done, but the cancel still needs an answer. The gateway keeps the
+    order's state until the engine's reject for that cancel arrives and answers it with an
+    OrderCancelReject.
+- **Every request gets exactly one answer, or the session ends.** ClOrdIDs are capped at 64
+  bytes and must be unique for the session's whole day (reusing one would let two orders share a
+  key), so every report fits the writer's buffer; a sequence number is consumed only by a message
+  that was actually written; a client that stops reading is cut off once 8 MB is queued, and a
+  closing session that won't take its Logout is dropped after a second, so cancel-on-disconnect
+  still runs.
+- **Backpressure without deadlock**: the gateway never drops a command, so if the engine's input
+  ring is full it waits, but while it waits it keeps draining the engine's output. Otherwise a
+  mass cancel-on-disconnect could fill both rings, leaving the gateway waiting on the engine and
+  the engine waiting on the gateway. `GatewayBackpressure` runs this with 64-slot rings.
+- **Pre-trade check**: orders above a configurable size (default 1,000,000) are rejected.
 - **I/O loop**: the gateway busy-polls non-blocking Boost.Asio sockets itself instead of
   running Asio's reactor. I measured `io_context::poll()` at about 12 µs per call on macOS even
   with nothing ready (a kqueue syscall plus bookkeeping), and an order needs two passes (read,
   then write the ack). With the reactor, the order round trip was 53 µs at the median. After
   switching to direct non-blocking `read_some`/`write_some` it was 14.5 µs, and 10.2 µs after
-  caching the SendingTime formatting (gmtime + strftime cost about a microsecond per message).
-  Bare loopback TCP ping-pong on the same machine is 7.0 µs, so the gateway, two ring hops and
-  the match add about 3 µs.
+  caching the SendingTime formatting (gmtime + strftime cost about a microsecond per message),
+  against 7.0 µs for bare loopback TCP ping-pong measured the same way. BENCHMARKS.md has the
+  current numbers next to a same-window baseline.
 
 ## 8. What I'd do next
 

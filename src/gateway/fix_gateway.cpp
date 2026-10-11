@@ -10,6 +10,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace vl {
 
@@ -19,6 +20,14 @@ using tcp = asio::ip::tcp;
 namespace {
 
 char fix_side(Side s) { return s == Side::Buy ? '1' : '2'; }
+
+// FIX doesn't cap ClOrdID length, but every venue does; ours keeps every outgoing
+// message well inside the writer's fixed buffer.
+constexpr std::size_t kMaxIdLen = 64;
+// A client that stops reading gets disconnected rather than buffering forever.
+constexpr std::size_t kMaxPendingOut = 8u << 20;
+
+std::string_view clip(std::string_view v) { return v.substr(0, kMaxIdLen); }
 
 }  // namespace
 
@@ -70,7 +79,8 @@ public:
         acceptor_.close();
         for (auto& sp : sessions_) sp->close("server shutting down");
         for (auto& sp : sessions_) sp->flush();
-        reap();
+        for (auto& sp : sessions_) sp->housekeeping(sc::now() + std::chrono::seconds(2));  // force close
+        reap(/*cancel_orders=*/false);  // the engine is stopping too
     }
 
     Stats stats() const { return stats_; }
@@ -93,14 +103,24 @@ private:
         void send(std::string_view type, auto&& add_fields) {
             if (!open_) return;
             std::array<char, 32> ts;
-            fix::Writer w(type, gw_.cfg_.comp_id, target_, out_seq_++, fix::utc_timestamp(ts));
+            fix::Writer w(type, gw_.cfg_.comp_id, target_, out_seq_, fix::utc_timestamp(ts));
             add_fields(w);
             const std::string_view msg = w.finish();
-            if (msg.empty()) return;
+            if (msg.empty()) {
+                // Can't happen with ids capped at kMaxIdLen; if it ever does, end the session
+                // rather than silently skip a report and leave a sequence gap.
+                return close("internal error: outgoing message too large");
+            }
+            ++out_seq_;  // only once the message exists
             out_.append(msg);
             ++gw_.stats_.messages_out;
             last_out_ = Clock::now();
+            if (out_.size() - out_off_ > kMaxPendingOut) shutdown();  // not reading: drop it
         }
+
+        // ClOrdIDs must be unique for the session's whole day, not just among live orders:
+        // reusing one would make two orders share a key.
+        bool claim_id(std::string_view id) { return used_ids_.emplace(id).second; }
 
         void close(std::string_view why) {
             if (!open_) return;
@@ -108,6 +128,7 @@ private:
             logged_on_ = false;
             open_ = false;
             closing_ = true;
+            close_deadline_ = Clock::now() + std::chrono::seconds(1);
             flush();
         }
 
@@ -144,7 +165,13 @@ private:
 
         // Heartbeats, and a dead-peer check at twice the heartbeat interval.
         void housekeeping(Clock::time_point now) {
-            if (!open_) return;
+            if (gone_) return;
+            // A peer that won't read our Logout doesn't get to keep the session (and its
+            // orders) alive: give the write a second, then drop the socket.
+            if (closing_) {
+                if (now > close_deadline_) shutdown();
+                return;
+            }
             if (logged_on_ && now - last_out_ >= std::chrono::seconds(heartbeat_s_)) send("0", [](fix::Writer&) {});
             if (now - last_in_ >= std::chrono::seconds(2 * heartbeat_s_ + 1)) close("heartbeat timeout");
         }
@@ -239,6 +266,8 @@ private:
         std::size_t len_ = 0;
         std::string out_;  // bytes waiting to be written
         std::size_t out_off_ = 0;
+        std::unordered_set<std::string> used_ids_;
+        Clock::time_point close_deadline_{};
         std::string target_;
         std::uint64_t in_seq_ = 1;
         std::uint64_t out_seq_ = 1;
@@ -284,7 +313,7 @@ private:
     }
 
     // Drop closed sessions and, if configured, cancel everything they left resting.
-    void reap() {
+    void reap(bool cancel_orders = true) {
         for (std::size_t i = 0; i < sessions_.size();) {
             if (!sessions_[i]->gone()) {
                 ++i;
@@ -294,7 +323,7 @@ private:
             by_session_id_.erase(id);
             sessions_[i] = std::move(sessions_.back());
             sessions_.pop_back();
-            on_session_gone(id);
+            if (cancel_orders) on_session_gone(id);
         }
     }
 
@@ -305,19 +334,29 @@ private:
         return k;
     }
 
+    // Never drop a command. If the engine's input is full, keep draining its output while
+    // we wait: the engine may itself be blocked on a full output ring, and if we only spun
+    // here the two threads would wait on each other forever.
     void push(const Command& c) {
-        while (!to_engine_.try_push(c)) std::this_thread::yield();  // backpressure, never drop
+        while (!to_engine_.try_push(c)) drain_events();
+    }
+
+    // Remove a ClOrdID mapping only if it still points at this order.
+    void unmap(std::uint64_t session, const std::string& clordid, OrderId id) {
+        if (clordid.empty()) return;
+        auto it = by_clordid_.find(key(session, clordid));
+        if (it != by_clordid_.end() && it->second == id) by_clordid_.erase(it);
     }
 
     void reject_order(Session& s, const fix::Message& m, std::string_view why, int reason_code) {
         s.send("8", [&](fix::Writer& w) {
             w.add(fix::tag::OrderID, "NONE");
-            w.add(fix::tag::ClOrdID, m.get(fix::tag::ClOrdID));
+            w.add(fix::tag::ClOrdID, m.get(fix::tag::ClOrdID).empty() ? std::string_view("NONE") : clip(m.get(fix::tag::ClOrdID)));
             w.add(fix::tag::ExecID, ++exec_id_);
             w.add(fix::tag::ExecType, '8');
             w.add(fix::tag::OrdStatus, '8');
-            w.add(fix::tag::Symbol, m.get(fix::tag::Symbol));
-            w.add(fix::tag::Side, m.get(fix::tag::Side).empty() ? std::string_view("1") : m.get(fix::tag::Side));
+            w.add(fix::tag::Symbol, m.get(fix::tag::Symbol).empty() ? std::string_view("NONE") : clip(m.get(fix::tag::Symbol)));
+            w.add(fix::tag::Side, m.get(fix::tag::Side) == "2" ? '2' : '1');
             w.add(fix::tag::LeavesQty, std::uint64_t{0});
             w.add(fix::tag::CumQty, std::uint64_t{0});
             w.add(fix::tag::AvgPx, std::uint64_t{0});
@@ -330,8 +369,8 @@ private:
                        std::string_view why) {
         s.send("9", [&](fix::Writer& w) {
             w.add(fix::tag::OrderID, "NONE");
-            w.add(fix::tag::ClOrdID, clordid);
-            w.add(fix::tag::OrigClOrdID, orig);
+            w.add(fix::tag::ClOrdID, clordid.empty() ? std::string_view("NONE") : clip(clordid));
+            w.add(fix::tag::OrigClOrdID, orig.empty() ? std::string_view("NONE") : clip(orig));
             w.add(fix::tag::OrdStatus, '8');
             w.add(fix::tag::CxlRejResponseTo, response_to);
             w.add(fix::tag::Text, why);
@@ -341,13 +380,15 @@ private:
     void on_new_order(Session& s, const fix::Message& m) {
         const std::string_view clordid = m.get(fix::tag::ClOrdID);
         if (clordid.empty()) return reject_order(s, m, "missing ClOrdID", 99);
-        if (by_clordid_.count(key(s.id(), clordid))) return reject_order(s, m, "duplicate ClOrdID", 6);
+        if (clordid.size() > kMaxIdLen) return reject_order(s, m, "ClOrdID longer than 64", 99);
+        if (!s.claim_id(clordid)) return reject_order(s, m, "duplicate ClOrdID", 6);
         const auto sym = symbol_index_.find(std::string(m.get(fix::tag::Symbol)));
         if (sym == symbol_index_.end()) return reject_order(s, m, "unknown symbol", 1);
         const std::string_view side = m.get(fix::tag::Side);
         if (side != "1" && side != "2") return reject_order(s, m, "unsupported Side", 99);
         const auto qty = m.get_uint(fix::tag::OrderQty);
-        if (!qty || *qty == 0 || *qty > UINT32_MAX) return reject_order(s, m, "bad OrderQty", 13);
+        if (!qty || *qty == 0) return reject_order(s, m, "bad OrderQty", 13);
+        if (*qty > cfg_.max_order_qty) return reject_order(s, m, "OrderQty above limit", 13);  // fat-finger check
         const std::string_view ord_type = m.get(fix::tag::OrdType);
         Command c;
         c.type = Command::Type::New;
@@ -355,8 +396,9 @@ private:
         c.side = side == "1" ? Side::Buy : Side::Sell;
         c.qty = static_cast<Qty>(*qty);
         if (ord_type == "1") {
+            // A market order can never rest: Day/GTC/IOC all mean IOC, FOK stays FOK.
             c.order_type = OrderType::Market;
-            c.tif = TimeInForce::IOC;
+            c.tif = m.get(fix::tag::TimeInForce) == "4" ? TimeInForce::FOK : TimeInForce::IOC;
         } else if (ord_type == "2") {
             const auto px = fix::parse_price(m.get(fix::tag::Price), cfg_.price_decimals);
             if (!px || *px <= 0) return reject_order(s, m, "bad Price", 99);
@@ -386,6 +428,8 @@ private:
 
     void on_cancel(Session& s, const fix::Message& m) {
         const std::string_view clordid = m.get(fix::tag::ClOrdID), orig = m.get(fix::tag::OrigClOrdID);
+        if (clordid.empty() || clordid.size() > kMaxIdLen) return cancel_reject(s, clordid, orig, '1', "bad ClOrdID");
+        if (!s.claim_id(clordid)) return cancel_reject(s, clordid, orig, '1', "duplicate ClOrdID");
         OrderId id = 0;
         OrderState* o = find_live(s, orig, id);
         if (!o) return cancel_reject(s, clordid, orig, '1', "unknown order");
@@ -400,13 +444,15 @@ private:
 
     void on_replace(Session& s, const fix::Message& m) {
         const std::string_view clordid = m.get(fix::tag::ClOrdID), orig = m.get(fix::tag::OrigClOrdID);
+        if (clordid.empty() || clordid.size() > kMaxIdLen) return cancel_reject(s, clordid, orig, '2', "bad ClOrdID");
+        if (!s.claim_id(clordid)) return cancel_reject(s, clordid, orig, '2', "duplicate ClOrdID");
         OrderId id = 0;
         OrderState* o = find_live(s, orig, id);
         if (!o) return cancel_reject(s, clordid, orig, '2', "unknown order");
         const auto qty = m.get_uint(fix::tag::OrderQty);
         const auto px = fix::parse_price(m.get(fix::tag::Price), cfg_.price_decimals);
         if (!qty || !px || *px <= 0) return cancel_reject(s, clordid, orig, '2', "bad OrderQty or Price");
-        if (*qty <= o->cum || *qty > UINT32_MAX) return cancel_reject(s, clordid, orig, '2', "bad OrderQty");
+        if (*qty <= o->cum || *qty > cfg_.max_order_qty) return cancel_reject(s, clordid, orig, '2', "bad OrderQty");
         if (!o->pending_clordid.empty()) return cancel_reject(s, clordid, orig, '2', "request already pending");
         o->pending_clordid = std::string(clordid);
         o->pending_qty = static_cast<Qty>(*qty);
@@ -416,17 +462,22 @@ private:
         c.book = o->book;
         c.id = id;
         c.price = *px;
-        c.qty = static_cast<Qty>(*qty - o->cum);  // engine works in open quantity
+        // The new total, not total minus our CumQty: a fill may be in flight in the engine,
+        // so only the engine knows the filled amount for certain and computes open from it.
+        c.qty = static_cast<Qty>(*qty);
         push(c);
     }
 
     void on_session_gone(std::uint64_t session) {
         if (!cfg_.cancel_on_disconnect) return;
-        for (auto& [id, o] : orders_) {
-            if (o.session != session || o.finished) continue;
+        // Collect first: push() may drain events, and that erases from orders_.
+        std::vector<std::pair<OrderId, std::uint16_t>> mine;
+        for (auto& [id, o] : orders_)
+            if (o.session == session && !o.finished) mine.emplace_back(id, o.book);
+        for (auto [id, book] : mine) {
             Command c;
             c.type = Command::Type::Cancel;
-            c.book = o.book;
+            c.book = book;
             c.id = id;
             push(c);
         }
@@ -487,7 +538,7 @@ private:
                 }
                 break;
             case EngineEvent::Type::Replaced:
-                by_clordid_.erase(key(o.session, o.clordid));
+                unmap(o.session, o.clordid, ev.id);
                 o.orig_clordid = o.clordid;
                 o.clordid = o.pending_clordid;
                 o.pending_clordid.clear();
@@ -498,8 +549,8 @@ private:
                 break;
         }
         if (done) {
-            by_clordid_.erase(key(o.session, o.clordid));
-            if (!o.orig_clordid.empty()) by_clordid_.erase(key(o.session, o.orig_clordid));
+            unmap(o.session, o.clordid, ev.id);
+            unmap(o.session, o.orig_clordid, ev.id);
             if (!o.pending_clordid.empty() && ev.type != EngineEvent::Type::Rejected) {
                 o.finished = true;  // wait for the in-flight request's reject
             } else {

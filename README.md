@@ -8,11 +8,11 @@ Measured on an Apple M3 Pro laptop, one core for the book:
 
 | | |
 |---|---|
-| Matching, synthetic lit-book flow (46% add, 42% cancel, 7% aggressive, 5% replace) | **53 M orders/s, 18.8 ns mean**, p99 ≤ 83 ns |
-| Same flow with 1M orders resting (out of cache) | 10.6 M orders/s, 95 ns mean |
-| Full NASDAQ trading day (Dec 30, 2019): 268.7M messages, 8,892 books | **~30 s, 8.4 to 9.4 M messages/s** |
-| ITCH validation: executions that hit the order our book had at the best price / first in line | **100.00% / 99.82%** of 5.72M |
-| FIX order round trip over loopback TCP, one order in flight | **10.2 µs p50**, 26.7 µs p99 (bare TCP: 7.0 µs) |
+| Matching engine, synthetic lit-book flow (48% add, 40% cancel, 7% marketable IOC, 5% replace) | **50 M book ops/s, 19.8 ns mean**, p99 < 125 ns |
+| Same flow with 1M orders resting (out of cache) | 7 to 12 M ops/s, ~115 ns mean |
+| Full NASDAQ trading day (Dec 30, 2019): 268.7M messages, 8,892 books | **29 to 35 s, 7.7 to 9.4 M messages/s** |
+| ITCH validation: NASDAQ 'E' executions that hit the order our book had at the best price / first in line | **100.00% / 99.82%** of 5.72M |
+| FIX order round trip over loopback TCP, one order in flight | **15 µs p50** on a loaded machine, 6 µs above bare TCP in the same window |
 
 Method, raw output and caveats (the M3's clock ticks every 41.7 ns, and what that does to
 percentiles) are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md). The reasoning behind every design
@@ -50,12 +50,16 @@ choice is in [docs/DESIGN.md](docs/DESIGN.md).
   random stream of 750k orders, cancels, replaces and bad inputs. Their event streams and full
   depth must match exactly. Planting a bug on purpose (wrong trade price, wrong priority rule, a
   flipped search predicate) fails it every time.
-- **Real data**: across a full NASDAQ day, every execution NASDAQ reports lands on an order our
-  book has at the best price, and 99.82% on the exact order our book has first in line. That's
-  only possible if the book keeps NASDAQ's price-time order.
-- 51 tests (book semantics, hash map vs `std::unordered_map`, the SPSC ring across two threads,
-  the FIX codec, ITCH decoding, and the gateway end to end over real TCP). CI runs them under
-  gcc and clang, with AddressSanitizer + UBSan and with ThreadSanitizer.
+- **Real data**: across a full NASDAQ day, every one of NASDAQ's 5.72M 'E' executions lands on an
+  order our book has at the best price, and 99.82% on the exact order our book has first in line.
+  That's only possible if the book keeps NASDAQ's price-time order.
+- **Races, reproduced on purpose**: a replace crossing a fill in flight, and a mass
+  cancel-on-disconnect with both rings full, each have a deterministic test that fails on the
+  earlier code and passes now.
+- 59 tests (book semantics, hash map vs `std::unordered_map`, the SPSC ring across two threads,
+  the FIX codec, ITCH decoding, and the gateway end to end over real TCP), clean under
+  AddressSanitizer + UBSan and ThreadSanitizer. CI runs them with gcc and clang on Linux and on
+  macOS.
 
 ## Build and run
 

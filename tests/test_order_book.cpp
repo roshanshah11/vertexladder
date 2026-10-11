@@ -252,6 +252,28 @@ TEST(OrderBook, ReplaceToCrossingPriceTrades) {
     EXPECT_TRUE(b.check_invariants());
 }
 
+TEST(OrderBook, ReplaceTakesTotalQuantityIncludingFills) {
+    Book b;
+    b.submit(limit(1, Side::Sell, 100, 100));
+    b.submit(limit(2, Side::Sell, 100, 100));
+    b.submit(limit(9, Side::Buy, 100, 60));  // order 1: 60 filled, 40 open
+    // A total of 50 is below the 60 already filled: rejected, nothing changes.
+    EXPECT_FALSE(b.replace(1, 100, 50));
+    EXPECT_EQ(last(b).reason, static_cast<int>(RejectReason::InvalidQuantity));
+    EXPECT_EQ(*b.open_qty(1), 40u);
+    // Total 80 -> 20 open, a size cut at the same price: keeps its place ahead of order 2.
+    EXPECT_TRUE(b.replace(1, 100, 80));
+    EXPECT_EQ(*b.open_qty(1), 20u);
+    b.submit(limit(10, Side::Buy, 100, 10));
+    EXPECT_EQ(trades(b).back().other, 1u);
+    // Total 150 -> 150 - 70 filled = 80 open, more size: goes behind order 2.
+    EXPECT_TRUE(b.replace(1, 100, 150));
+    EXPECT_EQ(*b.open_qty(1), 80u);
+    b.submit(limit(11, Side::Buy, 100, 10));
+    EXPECT_EQ(trades(b).back().other, 2u);
+    EXPECT_TRUE(b.check_invariants());
+}
+
 TEST(OrderBook, BookBuilderApi) {
     OrderBook<> b;
     EXPECT_TRUE(b.insert_resting(10, Side::Buy, 100, 50));

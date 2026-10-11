@@ -69,12 +69,13 @@ int main() {
         write_all(s, b, kSize);
         read_all(s, b, kSize);
         const auto t1 = std::chrono::steady_clock::now();
-        if (i >= kWarm) h.record(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()));
+        // 10 ns units: exact up to 655 us.
+        if (i >= kWarm) h.record(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()) / 10);
     }
     echo.join();
     close(s);
     close(ls);
-    auto us = [](std::uint64_t ns) { return static_cast<double>(ns) / 1000.0; };
+    auto us = [](std::uint64_t tens_of_ns) { return static_cast<double>(tens_of_ns) / 100.0; };
     std::printf("bare loopback TCP round trip (us): p50 %.1f  p90 %.1f  p99 %.1f  p99.9 %.1f\n", us(h.quantile(0.5)),
                 us(h.quantile(0.9)), us(h.quantile(0.99)), us(h.quantile(0.999)));
 }

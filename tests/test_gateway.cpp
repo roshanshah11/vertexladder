@@ -172,3 +172,165 @@ TEST_F(GatewayTest, CancelsOrdersWhenClientDisconnects) {
     exec(*b, "0");
     exec(*b, "4");  // nothing to trade against: ALICE's order was pulled
 }
+
+// ---- Regressions from the code review ------------------------------------------------
+
+// Owns the threads for the standalone tests below, so a failed ASSERT (which returns
+// early) still stops and joins them instead of terminating the test binary.
+struct Threads {
+    std::atomic<bool>& stop;
+    std::vector<std::thread> ts;
+    ~Threads() {
+        stop = true;
+        for (auto& t : ts)
+            if (t.joinable()) t.join();
+    }
+};
+
+TEST_F(GatewayTest, ReplaceAfterPartialFillUsesTheEngineFillCount) {
+    auto a = connect("ALICE");
+    auto b = connect("BOB");
+    order(*a, "a1", "2", 100, "10");
+    exec(*a, "0");
+    order(*b, "b1", "1", 60, "10", "AAPL", '3');
+    exec(*b, "0");
+    exec(*b, "F");
+    exec(*a, "F");  // a1: 60 filled, 40 open
+    a->send("G", [](fix::Writer& w) {
+        w.add(tag::ClOrdID, "a1-r").add(tag::OrigClOrdID, "a1").add(tag::Symbol, "AAPL").add(tag::Side, '2');
+        w.add(tag::OrderQty, std::uint64_t{80}).add(tag::OrdType, '2').add(tag::Price, "10");
+    });
+    auto r = exec(*a, "5");
+    EXPECT_EQ(r.get(tag::OrderQty), "80");
+    EXPECT_EQ(r.get(tag::CumQty), "60");
+    EXPECT_EQ(r.get(tag::LeavesQty), "20");  // OrderQty = CumQty + LeavesQty
+}
+
+TEST_F(GatewayTest, RejectsOverlongAndReusedClOrdIDs) {
+    auto a = connect("ALICE");
+    const std::string longid(200, 'x');
+    a->send("D", [&](fix::Writer& w) {
+        w.add(tag::ClOrdID, longid).add(tag::Symbol, "AAPL").add(tag::Side, '1');
+        w.add(tag::OrderQty, std::uint64_t{10}).add(tag::OrdType, '2').add(tag::Price, "5");
+    });
+    exec(*a, "8");
+    order(*a, "dup", "1", 10, "5");
+    exec(*a, "0");
+    a->send("F", [](fix::Writer& w) { w.add(tag::ClOrdID, "dup-c").add(tag::OrigClOrdID, "dup"); });
+    exec(*a, "4");
+    order(*a, "dup", "1", 10, "5");  // reused after the first one is gone: still a duplicate
+    EXPECT_EQ(exec(*a, "8").get(tag::OrdRejReason), "6");
+}
+
+TEST_F(GatewayTest, MarketFokIsAllOrNothing) {
+    auto a = connect("ALICE");
+    auto b = connect("BOB");
+    order(*a, "a1", "2", 50, "10");
+    exec(*a, "0");
+    b->send("D", [](fix::Writer& w) {
+        w.add(tag::ClOrdID, "b1").add(tag::Symbol, "AAPL").add(tag::Side, '1');
+        w.add(tag::OrderQty, std::uint64_t{100}).add(tag::OrdType, '1').add(tag::TimeInForce, '4');
+    });
+    exec(*b, "0");
+    auto c = exec(*b, "4");  // cancelled whole, no fill
+    EXPECT_EQ(c.get(tag::CumQty), "0");
+}
+
+TEST_F(GatewayTest, FatFingerQuantityRejected) {
+    auto a = connect("ALICE");
+    order(*a, "big", "1", 5'000'000, "10");
+    EXPECT_EQ(exec(*a, "8").get(tag::OrdRejReason), "13");
+}
+
+// Tiny rings: a disconnect that cancels hundreds of orders must not deadlock the gateway
+// (it waits on a full command ring while the engine waits on a full event ring).
+TEST(GatewayBackpressure, MassCancelOnDisconnectDoesNotDeadlock) {
+    Engine::CommandRing cmds{64};
+    Engine::EventRing events{64};
+    Engine engine{1, cmds, events};
+    GatewayConfig cfg;
+    cfg.port = 0;
+    cfg.symbols = {"AAPL"};
+    FixGateway gw(cfg, cmds, events);
+    std::atomic<bool> stop{false};
+    Threads threads{stop, {}};
+    threads.ts.emplace_back([&] { engine.run(stop); });
+    threads.ts.emplace_back([&] { gw.run(stop); });
+    {
+        FixTestClient a(gw.port(), "ALICE");
+        a.logon();
+        ASSERT_TRUE(a.expect("A"));
+        for (int i = 0; i < 600; ++i) {
+            const std::string id = "o" + std::to_string(i);
+            a.send("D", [&](fix::Writer& w) {
+                w.add(tag::ClOrdID, id).add(tag::Symbol, "AAPL").add(tag::Side, '2');
+                w.add(tag::OrderQty, std::uint64_t{1}).add(tag::OrdType, '2').add(tag::Price, "10");
+            });
+        }
+        for (int i = 0; i < 600; ++i) ASSERT_TRUE(a.expect("8")) << i;
+        a.close();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    FixTestClient b(gw.port(), "BOB");
+    b.logon();
+    ASSERT_TRUE(b.expect("A", std::chrono::milliseconds(3000)));  // still alive
+    b.send("D", [](fix::Writer& w) {
+        w.add(tag::ClOrdID, "b1").add(tag::Symbol, "AAPL").add(tag::Side, '1');
+        w.add(tag::OrderQty, std::uint64_t{600}).add(tag::OrdType, '2').add(tag::Price, "10").add(tag::TimeInForce, '3');
+    });
+    ASSERT_TRUE(b.expect("8"));
+    auto rest = b.expect("8");
+    ASSERT_TRUE(rest);
+    EXPECT_EQ(rest->get(tag::ExecType), "4");  // all 600 were cancelled: nothing to hit
+}
+
+// The replace/fill race, made deterministic: the engine thread starts only after the
+// gateway has queued all three commands, so when the gateway handles the replace it has
+// not yet heard about the fill (its CumQty is still 0). The engine must reject a new total
+// of 50 because 60 already filled. Sending "total - gateway CumQty" here would rest 50
+// more shares and overfill the order to 110.
+TEST(GatewayRace, ReplaceCrossingAnInFlightFillCannotOverfill) {
+    Engine::CommandRing cmds{1024};
+    Engine::EventRing events{1024};
+    Engine engine{1, cmds, events};
+    GatewayConfig cfg;
+    cfg.port = 0;
+    cfg.symbols = {"AAPL"};
+    FixGateway gw(cfg, cmds, events);
+    std::atomic<bool> stop{false};
+    Threads threads{stop, {}};
+    threads.ts.emplace_back([&] { gw.run(stop); });
+
+    FixTestClient a(gw.port(), "ALICE"), b(gw.port(), "BOB");
+    a.logon();
+    b.logon();
+    ASSERT_TRUE(a.expect("A"));
+    ASSERT_TRUE(b.expect("A"));
+    auto lim = [](FixTestClient& c, const char* id, char side, std::uint64_t q) {
+        c.send("D", [&](fix::Writer& w) {
+            w.add(tag::ClOrdID, id).add(tag::Symbol, "AAPL").add(tag::Side, side);
+            w.add(tag::OrderQty, q).add(tag::OrdType, '2').add(tag::Price, "10");
+        });
+    };
+    lim(a, "a1", '2', 100);
+    while (cmds.size_approx() < 1) std::this_thread::yield();
+    lim(b, "b1", '1', 60);
+    while (cmds.size_approx() < 2) std::this_thread::yield();
+    a.send("G", [](fix::Writer& w) {
+        w.add(tag::ClOrdID, "a1-r").add(tag::OrigClOrdID, "a1").add(tag::Symbol, "AAPL").add(tag::Side, '2');
+        w.add(tag::OrderQty, std::uint64_t{50}).add(tag::OrdType, '2').add(tag::Price, "10");
+    });
+    while (cmds.size_approx() < 3) std::this_thread::yield();
+
+    threads.ts.emplace_back([&] { engine.run(stop); });  // now let the engine see all three
+    auto ack = a.expect("8");
+    ASSERT_TRUE(ack);
+    EXPECT_EQ(ack->get(tag::ExecType), "0");
+    auto fill = a.expect("8");
+    ASSERT_TRUE(fill);
+    EXPECT_EQ(fill->get(tag::ExecType), "F");
+    EXPECT_EQ(fill->get(tag::LeavesQty), "40");
+    auto rej = a.expect("9");
+    ASSERT_TRUE(rej);
+    EXPECT_EQ(rej->type(), "9");  // OrderCancelReject: 50 is below the 60 already filled
+}

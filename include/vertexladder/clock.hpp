@@ -28,7 +28,12 @@ class Clock {
 public:
     static std::uint64_t now() noexcept {
 #if defined(VL_CLOCK_TSC)
-        return __rdtsc();
+        // rdtsc isn't ordered with the instructions around it; the fences keep the
+        // timed work from leaking across the timestamp.
+        _mm_lfence();
+        const std::uint64_t t = __rdtsc();
+        _mm_lfence();
+        return t;
 #elif defined(VL_CLOCK_MACH)
         return mach_absolute_time();
 #else

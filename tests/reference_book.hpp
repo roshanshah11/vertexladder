@@ -63,7 +63,7 @@ public:
         Qty left = match(o.id, o.side, limit, o.qty);
         if (left == 0) return;
         if (market || o.tif != TimeInForce::GTC) return cancel_event(o.id, left, CancelReason::IocRemainder);
-        rest(o.id, o.side, o.price, left);
+        rest(o.id, o.side, o.price, left, o.qty - left);
     }
 
     bool cancel(OrderId id) {
@@ -78,23 +78,35 @@ public:
         return true;
     }
 
-    bool replace(OrderId id, Price price, Qty qty) {
+    // new_total includes what has already filled, as in FIX.
+    bool replace(OrderId id, Price price, Qty new_total) {
         auto it = where_.find(id);
         if (it == where_.end()) return reject(id, RejectReason::UnknownOrder), false;
-        if (qty == 0) return reject(id, RejectReason::InvalidQuantity), false;
-        if (price <= 0) return reject(id, RejectReason::InvalidPrice), false;
         auto [side, old_price] = it->second;
         RefOrder& o = find(id);
-        if (price == old_price && qty <= o.qty) {
-            o.qty = qty;
-            events.push_back({Event::Kind::Replace, id, 0, price, qty, 0, 0, 0});
+        if (new_total <= o.filled) return reject(id, RejectReason::InvalidQuantity), false;
+        if (price <= 0) return reject(id, RejectReason::InvalidPrice), false;
+        const Qty open = new_total - o.filled;
+        if (price == old_price && open <= o.qty) {
+            o.qty = open;
+            events.push_back({Event::Kind::Replace, id, 0, price, open, 0, 0, 0});
             return true;
         }
+        const Qty filled = o.filled;
         erase(id);
-        events.push_back({Event::Kind::Replace, id, 0, price, qty, 0, 0, 0});
-        Qty left = match(id, side, price, qty);
-        if (left) rest(id, side, price, left);
+        events.push_back({Event::Kind::Replace, id, 0, price, open, 0, 0, 0});
+        Qty left = match(id, side, price, open);
+        if (left) rest(id, side, price, left, filled + (open - left));
         return true;
+    }
+
+    std::optional<Qty> filled(OrderId id) const {
+        auto it = where_.find(id);
+        if (it == where_.end()) return std::nullopt;
+        const auto& book = it->second.first == Side::Buy ? bids_ : asks_;
+        for (const RefOrder& o : book.at(it->second.second))
+            if (o.id == id) return o.filled;
+        return std::nullopt;
     }
 
     // Levels best-first, same shape as OrderBook::depth.
@@ -132,6 +144,7 @@ private:
     struct RefOrder {
         OrderId id;
         Qty qty;
+        Qty filled;
     };
     using Queue = std::list<RefOrder>;
     std::map<Price, Queue> bids_, asks_;  // both ascending by price
@@ -168,6 +181,7 @@ private:
                 RefOrder& m = q.front();
                 Qty fill = std::min(qty, m.qty);
                 m.qty -= fill;
+                m.filled += fill;
                 qty -= fill;
                 events.push_back({Event::Kind::Trade, taker, m.id, lvl->first, fill, m.qty, qty,
                                   static_cast<int>(side)});
@@ -181,8 +195,8 @@ private:
         return qty;
     }
 
-    void rest(OrderId id, Side side, Price price, Qty qty) {
-        (side == Side::Buy ? bids_ : asks_)[price].push_back({id, qty});
+    void rest(OrderId id, Side side, Price price, Qty qty, Qty filled = 0) {
+        (side == Side::Buy ? bids_ : asks_)[price].push_back({id, qty, filled});
         where_[id] = {side, price};
     }
 

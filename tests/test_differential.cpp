@@ -78,8 +78,15 @@ void run(const Params& p) {
             // Half the time keep the current price, to exercise the keep-priority path.
             const auto cur_px = ref.price_of(id);
             const Price np = (cur_px && (rng() & 1)) ? *cur_px : px(rng);
+            // New total quantity (FIX style, includes fills): sometimes a size cut that keeps
+            // priority, sometimes more size, sometimes at or below what already filled.
             const auto cur = ref.open_qty(id);
-            const Qty nq = cur && (rng() & 1) ? std::max<Qty>(1, *cur / 2) : qty(rng);
+            const Qty done = ref.filled(id).value_or(0);
+            const int pick = static_cast<int>(rng() % 3);
+            const Qty nq = !cur ? qty(rng)
+                           : pick == 0 ? done + std::max<Qty>(1, *cur / 2)
+                           : pick == 1 ? done + qty(rng)
+                                       : std::max<Qty>(1, done);
             ASSERT_EQ(fast.replace(id, np, nq), ref.replace(id, np, nq));
         }
 
